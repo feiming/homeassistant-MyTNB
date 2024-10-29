@@ -1,0 +1,15 @@
+{
+  "domain": "mytnb",
+  "name": "Tenaga Nasional",
+  "codeowners": [
+    "@feiming"
+  ],
+  "config_flow": true,
+  "dependencies": [],
+  "documentation": "https://www.home-assistant.io/integrations/mytnb",
+  "homekit": {},
+  "iot_class": "cloud_polling",
+  "requirements": [],
+  "ssdp": [],
+  "zeroconf": []
+}
