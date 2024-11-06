@@ -20,7 +20,7 @@ def main():
 
     login(args.username, args.password)
     smartmeter_url = get_smartmeter_url()
-    smart_meter(smartmeter_url)
+    login_smart_meter(smartmeter_url)
     sdpudcid = get_sdpudcid()
 
     get_data(
@@ -96,7 +96,7 @@ def get_smartmeter_url():
     # print(response.text)
 
 
-def smart_meter(smartmeter):
+def login_smart_meter(smartmeter):
     url = f"https://myaccount.mytnb.com.my{smartmeter}"
     print(url)
     # print(SESSION.cookies.get_dict())
