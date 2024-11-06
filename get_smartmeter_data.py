@@ -2,23 +2,17 @@ import requests
 import re
 import argparse
 import pprint
+from datetime import datetime, timedelta
+import os
+
+from dotenv import load_dotenv
+load_dotenv()
 
 SESSION = requests.Session()
 
 
 def main():
-    parser = argparse.ArgumentParser(
-        description="Process username and password.")
-
-    parser.add_argument(
-        "--username", type=str, required=True, help="The username for authentication."
-    )
-    parser.add_argument(
-        "--password", type=str, required=True, help="The password for authentication."
-    )
-    args = parser.parse_args()
-
-    login(args.username, args.password)
+    login(os.environ["USERNAME"], os.environ["PASSWORD"])
     smartmeter_url = get_smartmeter_url()
     smart_meter(smartmeter_url)
     sdpudcid = get_sdpudcid()
@@ -29,8 +23,8 @@ def main():
             "metric": "usage",
             "view": "BILL",
             "granularity": "MIN30",
-            "start": "2024-10-22+00:00",
-            "end": "2024-10-23+00:00",
+            "start": (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d+00:00"),
+            "end": datetime.now().strftime("%Y-%m-%d+00:00"),
         },
     )
     # get_data(sdpudcid, {"metric": "usage", "view": "BILL"})
