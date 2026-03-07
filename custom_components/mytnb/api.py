@@ -15,13 +15,13 @@ _LOGGER = logging.getLogger(__name__)
 class MyTNBAPI:
     """API client for MyTNB."""
 
-    def __init__(self, username: str, password: str, smartmeter_url: str, sdpudcid: str) -> None:
+    def __init__(self, username: str, password: str, smartmeter_url: str) -> None:
         """Initialize the API client."""
         self.username = username
         self.password = password
         self.smartmeter_url = smartmeter_url
         self.session = requests.Session()
-        self._sdpudcid = sdpudcid
+        self._sdpudcid: str | None = None
 
     def get_login_details(self) -> dict[str, str]:
         """Get login form details."""
@@ -56,10 +56,34 @@ class MyTNBAPI:
         return response.status_code == 200
 
     def get_sdpudcid(self) -> str:
-        """Get SDPUDCID (provided by user)."""
-        if not self._sdpudcid:
-            raise ValueError("sdpudcid not set")
-        return self._sdpudcid
+        """Get SDPUDCID from dashboard."""
+        if self._sdpudcid:
+            return self._sdpudcid
+
+        url = "https://smartliving.myaccount.mytnb.com.my/dashboard"
+        headers = {
+            "Host": "smartliving.myaccount.mytnb.com.my",
+            "Accept-Encoding": "gzip, deflate, br, zstd",
+            "DNT": "1",
+            "Connection": "keep-alive",
+            "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/png,image/svg+xml,*/*;q=0.8",
+        }
+        response = self.session.request("GET", url, headers=headers)
+        response.raise_for_status()
+        
+        match = re.search(r'"sdpudcid":"(\d+)"', response.text)
+        if match:
+            self._sdpudcid = match.group(1)
+            return self._sdpudcid
+        
+        # Log more details for debugging
+        _LOGGER.warning(
+            "Could not find sdpudcid in dashboard response. Status: %s, Response length: %d",
+            response.status_code,
+            len(response.text) if response.text else 0,
+        )
+        raise ValueError("Could not find sdpudcid in dashboard response")
 
     def get_data(
         self,

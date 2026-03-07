@@ -12,7 +12,7 @@ from homeassistant.const import CONF_PASSWORD, CONF_USERNAME
 from homeassistant.core import HomeAssistant
 from homeassistant.exceptions import HomeAssistantError
 
-from .const import CONF_SMARTMETER_URL, CONF_SDPUDCID, DOMAIN
+from .const import CONF_SMARTMETER_URL, DOMAIN
 from .api import MyTNBAPI
 
 _LOGGER = logging.getLogger(__name__)
@@ -22,7 +22,6 @@ STEP_USER_DATA_SCHEMA = vol.Schema(
         vol.Required(CONF_USERNAME): str,
         vol.Required(CONF_PASSWORD): str,
         vol.Required(CONF_SMARTMETER_URL): str,
-        vol.Required(CONF_SDPUDCID): str,
     }
 )
 
@@ -36,12 +35,19 @@ async def validate_input(hass: HomeAssistant, data: dict[str, Any]) -> dict[str,
         data[CONF_USERNAME],
         data[CONF_PASSWORD],
         data[CONF_SMARTMETER_URL],
-        data[CONF_SDPUDCID],
     )
 
     # Authenticate in executor since requests is synchronous
     if not await hass.async_add_executor_job(api.authenticate):
         raise InvalidAuth
+
+    # Try to get sdpudcid to verify connection (non-blocking if it fails)
+    # Authentication already succeeded, so sdpudcid can be fetched later if needed
+    try:
+        await hass.async_add_executor_job(api.get_sdpudcid)
+    except Exception as err:
+        _LOGGER.warning("Could not get sdpudcid during setup (will retry later): %s", err)
+        # Don't fail config flow - authentication succeeded, sdpudcid can be fetched later
 
     return {"title": f"MyTNB ({data[CONF_USERNAME]})"}
 
