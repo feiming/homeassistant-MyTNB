@@ -10,10 +10,15 @@
         },
         "step": {
             "user": {
+                "title": "MyTNB Account",
+                "description": "Enter your MyTNB account credentials to access your smart meter data.",
                 "data": {
-                    "host": "Host",
                     "password": "Password",
+                    "smartmeter_url": "Smart Meter URL",
                     "username": "Username"
+                },
+                "data_description": {
+                    "smartmeter_url": "The full URL to your smart meter page from your MyTNB account dashboard"
                 }
             }
         }

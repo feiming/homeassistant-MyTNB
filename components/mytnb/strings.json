@@ -2,10 +2,15 @@
   "config": {
     "step": {
       "user": {
+        "title": "MyTNB Account",
+        "description": "Enter your MyTNB account credentials to access your smart meter data.",
         "data": {
-          "host": "[%key:common::config_flow::data::host%]",
           "username": "[%key:common::config_flow::data::username%]",
-          "password": "[%key:common::config_flow::data::password%]"
+          "password": "[%key:common::config_flow::data::password%]",
+          "smartmeter_url": "Smart Meter URL"
+        },
+        "data_description": {
+          "smartmeter_url": "The full URL to your smart meter page from your MyTNB account dashboard"
         }
       }
     },

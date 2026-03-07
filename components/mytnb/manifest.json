@@ -6,10 +6,13 @@
   ],
   "config_flow": true,
   "dependencies": [],
-  "documentation": "https://www.home-assistant.io/integrations/mytnb",
+  "documentation": "https://github.com/feiming/homeassistant-MyTNB",
   "homekit": {},
   "iot_class": "cloud_polling",
-  "requirements": [],
+  "requirements": [
+    "requests>=2.31.0"
+  ],
   "ssdp": [],
+  "version": "1.0.0",
   "zeroconf": []
 }
