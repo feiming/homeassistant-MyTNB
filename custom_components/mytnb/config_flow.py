@@ -41,12 +41,13 @@ async def validate_input(hass: HomeAssistant, data: dict[str, Any]) -> dict[str,
     if not await hass.async_add_executor_job(api.authenticate):
         raise InvalidAuth
 
-    # Try to get sdpudcid to verify connection
+    # Try to get sdpudcid to verify connection (non-blocking if it fails)
+    # Authentication already succeeded, so sdpudcid can be fetched later if needed
     try:
         await hass.async_add_executor_job(api.get_sdpudcid)
     except Exception as err:
-        _LOGGER.exception("Failed to get sdpudcid: %s", err)
-        raise CannotConnect from err
+        _LOGGER.warning("Could not get sdpudcid during setup (will retry later): %s", err)
+        # Don't fail config flow - authentication succeeded, sdpudcid can be fetched later
 
     return {"title": f"MyTNB ({data[CONF_USERNAME]})"}
 

@@ -70,11 +70,20 @@ class MyTNBAPI:
             "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/png,image/svg+xml,*/*;q=0.8",
         }
         response = self.session.request("GET", url, headers=headers)
+        response.raise_for_status()
+        
         match = re.search(r'"sdpudcid":"(\d+)"', response.text)
         if match:
             self._sdpudcid = match.group(1)
             return self._sdpudcid
-        raise ValueError("Could not find sdpudcid")
+        
+        # Log more details for debugging
+        _LOGGER.warning(
+            "Could not find sdpudcid in dashboard response. Status: %s, Response length: %d",
+            response.status_code,
+            len(response.text) if response.text else 0,
+        )
+        raise ValueError("Could not find sdpudcid in dashboard response")
 
     def get_data(
         self,
