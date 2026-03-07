@@ -3,6 +3,7 @@
 DOMAIN = "mytnb"
 
 CONF_SMARTMETER_URL = "smartmeter_url"
+CONF_SDPUDCID = "sdpudcid"
 
 ATTR_SDPUDCID = "sdpudcid"
 ATTR_METRIC = "metric"

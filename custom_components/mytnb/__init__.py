@@ -19,6 +19,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: MyTNBConfigEntry) -> boo
         entry.data["username"],
         entry.data["password"],
         entry.data["smartmeter_url"],
+        entry.data["sdpudcid"],
     )
 
     # Store API instance in runtime_data
