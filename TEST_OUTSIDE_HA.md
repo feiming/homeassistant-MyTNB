@@ -81,7 +81,7 @@ You can also test individual components manually:
 ### Test API Client
 
 ```python
-from components.mytnb.api import MyTNBAPI
+from custom_components.mytnb.api import MyTNBAPI
 import os
 from dotenv import load_dotenv
 
@@ -191,7 +191,7 @@ SMARTMETER_URL=https://myaccount.mytnb.com.my/AccountManagement/SmartMeter/Index
 
 **Error:** `ModuleNotFoundError: No module named 'mytnb'`
 
-**Solution:** The test scripts automatically add `components` to the Python path. If you're running manually, make sure you're in the project root directory.
+**Solution:** The test scripts automatically add `custom_components` to the Python path. If you're running manually, make sure you're in the project root directory.
 
 ### No Data Points
 

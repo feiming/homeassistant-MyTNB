@@ -25,7 +25,7 @@ A Home Assistant custom integration to monitor your Tenaga Nasional Berhad (TNB)
 
 ### Manual Installation
 
-1. Copy the `mytnb` folder from `components/mytnb` to your Home Assistant `custom_components` directory:
+1. Copy the `mytnb` folder from `custom_components/mytnb` to your Home Assistant `custom_components` directory:
    ```
    <config>/custom_components/mytnb/
    ```
@@ -92,7 +92,7 @@ This integration was converted from a standalone Python script (`get_smartmeter_
 
 ```
 homeassistant-MyTNB/
-├── components/
+├── custom_components/
 │   └── mytnb/
 │       ├── __init__.py          # Integration setup
 │       ├── manifest.json         # Integration metadata

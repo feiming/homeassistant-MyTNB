@@ -9,8 +9,8 @@ from datetime import datetime, timedelta
 from unittest.mock import Mock, AsyncMock, patch
 from dotenv import load_dotenv
 
-# Add components to path
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "components"))
+# Add custom_components to path
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "custom_components"))
 
 from mytnb.api import MyTNBAPI
 from mytnb.const import (
