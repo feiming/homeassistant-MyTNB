@@ -94,8 +94,7 @@ class MyTNBCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
         for metric in ["usage", "cost"]:
             try:
-                result = await self.hass.async_add_executor_job(
-                    self.api.get_data,
+                result = await self.api.get_data(
                     metric,
                     DEFAULT_VIEW,
                     DEFAULT_GRANULARITY,
@@ -109,7 +108,7 @@ class MyTNBCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
         # Get sdpudcid for attributes
         try:
-            sdpudcid = await self.hass.async_add_executor_job(self.api.get_sdpudcid)
+            sdpudcid = await self.api.get_sdpudcid()
             data["sdpudcid"] = sdpudcid
         except Exception as err:
             _LOGGER.error("Error fetching sdpudcid: %s", err)
@@ -143,50 +142,42 @@ class MyTNBSensor(CoordinatorEntity[MyTNBCoordinator], SensorEntity):
             return None
 
         # Extract the latest value from the timeseries data
-        # The API returns data in format: {"data": [{"timestamp": "...", "value": ...}, ...]}
-        # or {"data": {"timestamp": value, ...}} (dict format)
+        # The API returns data in format: {"data": {"timeseries": [{"data": [{"datetime": "...", "value": ...}], ...}, ...], ...}}
+        
+        # Handle nested structure: {"data": {"timeseries": [...]}}
         if isinstance(metric_data, dict) and "data" in metric_data:
-            data_points = metric_data["data"]
-            
-            # Handle list format
-            if isinstance(data_points, list) and len(data_points) > 0:
-                # Get the most recent data point
-                latest = data_points[-1]
-                if isinstance(latest, dict) and "value" in latest:
-                    return float(latest["value"])
-            
-            # Handle dict format (keys are timestamps, values are numbers or dicts)
-            elif isinstance(data_points, dict):
-                values = []
-                for key, value in data_points.items():
-                    if isinstance(value, (int, float)):
-                        values.append((key, float(value)))
-                    elif isinstance(value, dict):
-                        # Try to find numeric value in nested dict
-                        if "value" in value:
-                            val = value["value"]
-                            if isinstance(val, (int, float)):
-                                values.append((key, float(val)))
-                        elif "usage" in value and self.entity_description.key == "usage":
-                            val = value["usage"]
-                            if isinstance(val, (int, float)):
-                                values.append((key, float(val)))
-                        elif "cost" in value and self.entity_description.key == "cost":
-                            val = value["cost"]
-                            if isinstance(val, (int, float)):
-                                values.append((key, float(val)))
-                        # If dict has numeric keys, try those
-                        elif len(value) > 0:
-                            for k, v in value.items():
-                                if isinstance(v, (int, float)):
-                                    values.append((key, float(v)))
-                                    break
-                
-                if values:
-                    # Sort by key (timestamp) to get latest
-                    sorted_values = sorted(values, key=lambda x: str(x[0]))
-                    if sorted_values:
-                        return sorted_values[-1][1]
+            inner_data = metric_data["data"]
+            if isinstance(inner_data, dict) and "timeseries" in inner_data:
+                timeseries = inner_data["timeseries"]
+                if isinstance(timeseries, list) and len(timeseries) > 0:
+                    # Flatten timeseries into a list of data points
+                    data_points = []
+                    for item in timeseries:
+                        if isinstance(item, dict) and "data" in item:
+                            item_data = item["data"]
+                            if isinstance(item_data, list) and len(item_data) > 0:
+                                data_points.extend(item_data)
+                    
+                    if data_points:
+                        # Sort by datetime to get the most recent data point
+                        def get_datetime(point):
+                            if isinstance(point, dict):
+                                dt = point.get("datetime") or ""
+                                # Handle datetime format "2026-03-02 00:00" for proper sorting
+                                return dt
+                            return ""
+                        
+                        sorted_points = sorted(data_points, key=get_datetime)
+                        if sorted_points:
+                            latest = sorted_points[-1]
+                            if isinstance(latest, dict) and "value" in latest:
+                                val = latest["value"]
+                                if val is not None:
+                                    try:
+                                        return float(val)
+                                    except (ValueError, TypeError):
+                                        _LOGGER.warning("Could not convert value to float: %s", val)
+                                        return None
 
         return None
 

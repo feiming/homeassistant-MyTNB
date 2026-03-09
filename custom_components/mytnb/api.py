@@ -7,7 +7,7 @@ import logging
 from datetime import datetime, timedelta
 from typing import Any
 
-import requests
+import aiohttp
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -20,25 +20,45 @@ class MyTNBAPI:
         self.username = username
         self.password = password
         self.smartmeter_url = smartmeter_url
-        self.session = requests.Session()
+        self._session: aiohttp.ClientSession | None = None
         self._sdpudcid: str | None = None
 
-    def get_login_details(self) -> dict[str, str]:
+    async def _get_session(self) -> aiohttp.ClientSession:
+        """Get or create aiohttp session."""
+        if self._session is None or self._session.closed:
+            self._session = aiohttp.ClientSession()
+        return self._session
+
+    async def close(self) -> None:
+        """Close the aiohttp session."""
+        if self._session and not self._session.closed:
+            await self._session.close()
+
+    async def __aenter__(self) -> MyTNBAPI:
+        """Async context manager entry."""
+        return self
+
+    async def __aexit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
+        """Async context manager exit."""
+        await self.close()
+
+    async def get_login_details(self) -> dict[str, str]:
         """Get login form details."""
+        session = await self._get_session()
         url = "https://www.mytnb.com.my/api/sitecore/Account/Login"
         payload = {"Email": self.username, "Password": self.password}
-        response = self.session.request("POST", url, data=payload)
-        matches = re.findall(r'name="([^"]+)" value="([^"]*)"', response.text)
-        return {name: value for name, value in matches}
+        async with session.post(url, data=payload) as response:
+            text = await response.text()
+            matches = re.findall(r'name="([^"]+)" value="([^"]*)"', text)
+            return {name: value for name, value in matches}
 
-    def login(self) -> bool:
+    async def login(self) -> bool:
         """Login to MyTNB."""
+        session = await self._get_session()
         url = "https://myaccount.mytnb.com.my/SSO/SSOHandler"
-        payload = self.get_login_details()
-        response = self.session.request("POST", url, data=payload)
-        if response.status_code == 200:
-            return True
-        return False
+        payload = await self.get_login_details()
+        async with session.post(url, data=payload) as response:
+            return response.status == 200
 
     def get_smartmeter_path(self) -> str:
         """Extract smartmeter path from URL."""
@@ -48,18 +68,20 @@ class MyTNBAPI:
             return match.group(0)
         raise ValueError("Could not find smartmeter URL path")
 
-    def access_smartmeter(self) -> bool:
+    async def access_smartmeter(self) -> bool:
         """Access smartmeter page."""
+        session = await self._get_session()
         smartmeter_path = self.get_smartmeter_path()
         url = f"https://myaccount.mytnb.com.my{smartmeter_path}"
-        response = self.session.request("GET", url)
-        return response.status_code == 200
+        async with session.get(url) as response:
+            return response.status == 200
 
-    def get_sdpudcid(self) -> str:
+    async def get_sdpudcid(self) -> str:
         """Get SDPUDCID from dashboard."""
         if self._sdpudcid:
             return self._sdpudcid
 
+        session = await self._get_session()
         url = "https://smartliving.myaccount.mytnb.com.my/dashboard"
         headers = {
             "Host": "smartliving.myaccount.mytnb.com.my",
@@ -69,23 +91,24 @@ class MyTNBAPI:
             "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
             "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/png,image/svg+xml,*/*;q=0.8",
         }
-        response = self.session.request("GET", url, headers=headers)
-        response.raise_for_status()
-        
-        match = re.search(r'"sdpudcid":"(\d+)"', response.text)
-        if match:
-            self._sdpudcid = match.group(1)
-            return self._sdpudcid
-        
-        # Log more details for debugging
-        _LOGGER.warning(
-            "Could not find sdpudcid in dashboard response. Status: %s, Response length: %d",
-            response.status_code,
-            len(response.text) if response.text else 0,
-        )
-        raise ValueError("Could not find sdpudcid in dashboard response")
+        async with session.get(url, headers=headers) as response:
+            response.raise_for_status()
+            text = await response.text()
+            
+            match = re.search(r'"sdpudcid":"(\d+)"', text)
+            if match:
+                self._sdpudcid = match.group(1)
+                return self._sdpudcid
+            
+            # Log more details for debugging
+            _LOGGER.warning(
+                "Could not find sdpudcid in dashboard response. Status: %s, Response length: %d",
+                response.status,
+                len(text) if text else 0,
+            )
+            raise ValueError("Could not find sdpudcid in dashboard response")
 
-    def get_data(
+    async def get_data(
         self,
         metric: str,
         view: str = "BILL",
@@ -102,7 +125,8 @@ class MyTNBAPI:
             start: Start date in format 'YYYY-MM-DD+00:00'
             end: End date in format 'YYYY-MM-DD+00:00'
         """
-        sdpudcid = self.get_sdpudcid()
+        sdpudcid = await self.get_sdpudcid()
+        session = await self._get_session()
         url = "https://smartliving.myaccount.mytnb.com.my/my_energy_request/timeseries"
         headers = {
             "Referer": f"https://smartliving.myaccount.mytnb.com.my/commodity/electric/{metric}",
@@ -130,20 +154,20 @@ class MyTNBAPI:
         if end:
             query_params["end"] = end
 
-        response = self.session.request("GET", url, headers=headers, params=query_params)
-        response.raise_for_status()
-        
-        # Debug: log the actual URL and params being sent
-        if _LOGGER.isEnabledFor(logging.DEBUG):
-            _LOGGER.debug(f"API request URL: {response.url}")
-            _LOGGER.debug(f"Query params: {query_params}")
-        
-        return response.json()
+        async with session.get(url, headers=headers, params=query_params) as response:
+            response.raise_for_status()
+            
+            # Debug: log the actual URL and params being sent
+            if _LOGGER.isEnabledFor(logging.DEBUG):
+                _LOGGER.debug(f"API request URL: {str(response.url)}")
+                _LOGGER.debug(f"Query params: {query_params}")
+            
+            return await response.json()
 
-    def authenticate(self) -> bool:
+    async def authenticate(self) -> bool:
         """Authenticate and initialize session."""
-        if not self.login():
+        if not await self.login():
             return False
-        if not self.access_smartmeter():
+        if not await self.access_smartmeter():
             return False
         return True
