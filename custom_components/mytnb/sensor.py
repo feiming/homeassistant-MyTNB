@@ -85,6 +85,14 @@ class MyTNBCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
     async def _async_update_data(self) -> dict[str, Any]:
         """Fetch data from MyTNB API."""
+        # Authenticate (login and access smartmeter) before fetching data
+        try:
+            if not await self.api.authenticate():
+                raise Exception("Authentication failed")
+        except Exception as err:
+            _LOGGER.error("Error authenticating: %s", err)
+            raise
+
         end_date = datetime.now()
         start_date = end_date - timedelta(days=7)
         start_str = start_date.strftime("%Y-%m-%d+00:00")

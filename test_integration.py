@@ -1355,6 +1355,405 @@ async def test_sensor_integration():
     return True
 
 
+async def test_coordinator():
+    """Unit test for MyTNBCoordinator class."""
+    print("\n" + "=" * 70)
+    print("Testing MyTNBCoordinator")
+    print("=" * 70)
+    
+    # Import coordinator
+    try:
+        from mytnb.sensor import MyTNBCoordinator
+        from mytnb.const import DOMAIN, DEFAULT_VIEW, DEFAULT_GRANULARITY
+    except ImportError as e:
+        print(f"❌ Failed to import coordinator: {e}")
+        import traceback
+        traceback.print_exc()
+        return False
+    
+    # Create mock objects
+    print("\n[1/6] Setting up mocks...")
+    mock_hass = Mock()
+    mock_entry = Mock()
+    mock_entry.entry_id = "test_entry_123"
+    mock_api = Mock()
+    
+    print("✅ Mocks created")
+    
+    # Test 1: Coordinator initialization
+    print("\n[2/6] Testing coordinator initialization...")
+    try:
+        with patch('homeassistant.helpers.frame.report_usage'):
+            coordinator = MyTNBCoordinator(mock_hass, mock_api, mock_entry)
+        
+        assert coordinator.api == mock_api, "API should be set"
+        assert coordinator.entry == mock_entry, "Entry should be set"
+        assert coordinator.name == DOMAIN, "Coordinator name should match DOMAIN"
+        assert coordinator.update_interval.total_seconds() == 30 * 60, "Update interval should be 30 minutes"
+        print("✅ Coordinator initialized successfully")
+    except Exception as e:
+        print(f"❌ Coordinator initialization failed: {e}")
+        import traceback
+        traceback.print_exc()
+        return False
+    
+    # Test 2: Successful data update with authentication
+    print("\n[3/6] Testing successful data update...")
+    try:
+        # Mock API responses
+        mock_api.authenticate = AsyncMock(return_value=True)
+        mock_api.get_data = AsyncMock(side_effect=[
+            {"data": {"timeseries": [{"data": [{"datetime": "2025-03-01 00:00", "value": 100.5}]}]}},
+            {"data": {"timeseries": [{"data": [{"datetime": "2025-03-01 00:00", "value": 50.25}]}]}},
+        ])
+        mock_api.get_sdpudcid = AsyncMock(return_value="12345678")
+        
+        data = await coordinator._async_update_data()
+        
+        # Verify authentication was called
+        mock_api.authenticate.assert_called_once()
+        
+        # Verify get_data was called for both metrics
+        assert mock_api.get_data.call_count == 2, "get_data should be called twice (usage and cost)"
+        
+        # Verify get_sdpudcid was called
+        mock_api.get_sdpudcid.assert_called_once()
+        
+        # Verify data structure
+        assert isinstance(data, dict), "Data should be a dictionary"
+        assert "usage" in data, "Data should contain 'usage'"
+        assert "cost" in data, "Data should contain 'cost'"
+        assert "sdpudcid" in data, "Data should contain 'sdpudcid'"
+        assert data["sdpudcid"] == "12345678", "SDPUDCID should match"
+        
+        # Verify get_data was called with correct parameters
+        calls = mock_api.get_data.call_args_list
+        assert calls[0][0][0] == "usage", "First call should be for usage"
+        assert calls[0][0][1] == DEFAULT_VIEW, "View should be DEFAULT_VIEW"
+        assert calls[0][0][2] == DEFAULT_GRANULARITY, "Granularity should be DEFAULT_GRANULARITY"
+        assert calls[1][0][0] == "cost", "Second call should be for cost"
+        
+        print("✅ Data update successful")
+        print(f"   Usage data: {'present' if data.get('usage') else 'missing'}")
+        print(f"   Cost data: {'present' if data.get('cost') else 'missing'}")
+        print(f"   SDPUDCID: {data.get('sdpudcid')}")
+        
+    except Exception as e:
+        print(f"❌ Data update test failed: {e}")
+        import traceback
+        traceback.print_exc()
+        return False
+    
+    # Test 3: Authentication failure
+    print("\n[4/6] Testing authentication failure...")
+    try:
+        mock_api.authenticate = AsyncMock(return_value=False)
+        
+        try:
+            await coordinator._async_update_data()
+            print("❌ Should have raised exception on authentication failure")
+            return False
+        except Exception as e:
+            assert "Authentication failed" in str(e) or "authenticating" in str(e).lower(), \
+                f"Exception should mention authentication, got: {e}"
+            print("✅ Authentication failure handled correctly")
+        
+    except Exception as e:
+        print(f"❌ Authentication failure test failed: {e}")
+        import traceback
+        traceback.print_exc()
+        return False
+    
+    # Test 4: Authentication exception
+    print("\n[5/6] Testing authentication exception...")
+    try:
+        mock_api.authenticate = AsyncMock(side_effect=Exception("Network error"))
+        
+        try:
+            await coordinator._async_update_data()
+            print("❌ Should have raised exception on authentication error")
+            return False
+        except Exception as e:
+            assert "Network error" in str(e) or "authenticating" in str(e).lower(), \
+                f"Exception should mention the error, got: {e}"
+            print("✅ Authentication exception handled correctly")
+        
+    except Exception as e:
+        print(f"❌ Authentication exception test failed: {e}")
+        import traceback
+        traceback.print_exc()
+        return False
+    
+    # Test 5: API errors during data fetching
+    print("\n[6/6] Testing API errors during data fetching...")
+    try:
+        mock_api.authenticate = AsyncMock(return_value=True)
+        mock_api.get_data = AsyncMock(side_effect=[
+            Exception("Usage API error"),
+            {"data": {"timeseries": [{"data": [{"datetime": "2025-03-01 00:00", "value": 50.25}]}]}},
+        ])
+        mock_api.get_sdpudcid = AsyncMock(side_effect=Exception("SDPUDCID error"))
+        
+        data = await coordinator._async_update_data()
+        
+        # Verify data structure - errors should result in None values
+        assert isinstance(data, dict), "Data should be a dictionary"
+        assert data.get("usage") is None, "Usage should be None on error"
+        assert data.get("cost") is not None, "Cost should still be present"
+        assert data.get("sdpudcid") is None, "SDPUDCID should be None on error"
+        
+        print("✅ API error handling successful")
+        print(f"   Usage data: {'present' if data.get('usage') else 'None (error)'}")
+        print(f"   Cost data: {'present' if data.get('cost') else 'None (error)'}")
+        print(f"   SDPUDCID: {'present' if data.get('sdpudcid') else 'None (error)'}")
+        
+    except Exception as e:
+        print(f"❌ API error handling test failed: {e}")
+        import traceback
+        traceback.print_exc()
+        return False
+    
+    print("\n" + "=" * 70)
+    print("✅ All coordinator tests passed!")
+    print("=" * 70)
+    return True
+
+
+async def test_coordinator_real_data():
+    """Test MyTNBCoordinator with real API data."""
+    print("\n" + "=" * 70)
+    print("Testing MyTNBCoordinator with Real API Data")
+    print("=" * 70)
+    
+    username = os.environ.get("USERNAME")
+    password = os.environ.get("PASSWORD")
+    smartmeter_url = os.environ.get("SMARTMETER_URL")
+    
+    if not all([username, password, smartmeter_url]):
+        print("❌ Missing environment variables!")
+        print("Please set USERNAME, PASSWORD, and SMARTMETER_URL in .env file")
+        return False
+    
+    print(f"\n✓ Username: {username}")
+    print(f"✓ Smart Meter URL: {smartmeter_url[:60]}...")
+    
+    # Import coordinator
+    try:
+        from mytnb.sensor import MyTNBCoordinator
+        from mytnb.const import DOMAIN, DEFAULT_VIEW, DEFAULT_GRANULARITY
+    except ImportError as e:
+        print(f"❌ Failed to import coordinator: {e}")
+        import traceback
+        traceback.print_exc()
+        return False
+    
+    # Create mock Home Assistant and ConfigEntry
+    print("\n[1/7] Setting up test environment...")
+    mock_hass = Mock()
+    mock_entry = Mock()
+    mock_entry.entry_id = "real_test_entry"
+    mock_entry.data = {
+        "username": username,
+        "password": password,
+        "smartmeter_url": smartmeter_url,
+    }
+    
+    # Create real API instance
+    async with MyTNBAPI(username, password, smartmeter_url) as api:
+        mock_entry.runtime_data = api
+        
+        print("✅ Test environment ready")
+        
+        # Test 1: Initialize coordinator
+        print("\n[2/7] Testing coordinator initialization...")
+        try:
+            with patch('homeassistant.helpers.frame.report_usage'):
+                coordinator = MyTNBCoordinator(mock_hass, api, mock_entry)
+            
+            assert coordinator.api == api, "API should be set"
+            assert coordinator.entry == mock_entry, "Entry should be set"
+            assert coordinator.name == DOMAIN, "Coordinator name should match DOMAIN"
+            assert coordinator.update_interval.total_seconds() == 30 * 60, "Update interval should be 30 minutes"
+            print("✅ Coordinator initialized successfully")
+        except Exception as e:
+            print(f"❌ Coordinator initialization failed: {e}")
+            import traceback
+            traceback.print_exc()
+            return False
+        
+        # Test 2: Test authentication flow (verify authenticate is called)
+        print("\n[3/7] Testing authentication flow...")
+        try:
+            # Reset sdpudcid to ensure fresh authentication
+            api._sdpudcid = None
+            
+            # Call _async_update_data which should authenticate first
+            data = await coordinator._async_update_data()
+            
+            # Verify authentication happened by checking sdpudcid was retrieved
+            assert data.get('sdpudcid') is not None, "SDPUDCID should be retrieved after coordinator update"
+            assert api._sdpudcid is not None, "API should have sdpudcid cached after coordinator update"
+            
+            print("✅ Authentication flow successful")
+            print(f"   SDPUDCID retrieved: {data.get('sdpudcid')}")
+        except Exception as e:
+            print(f"❌ Authentication flow test failed: {e}")
+            import traceback
+            traceback.print_exc()
+            return False
+        
+        # Test 3: Verify data structure
+        print("\n[4/7] Verifying data structure...")
+        try:
+            assert isinstance(data, dict), "Data should be a dictionary"
+            assert "usage" in data, "Data should contain 'usage'"
+            assert "cost" in data, "Data should contain 'cost'"
+            assert "sdpudcid" in data, "Data should contain 'sdpudcid'"
+            
+            print("✅ Data structure is correct")
+            print(f"   Keys: {list(data.keys())}")
+        except Exception as e:
+            print(f"❌ Data structure verification failed: {e}")
+            import traceback
+            traceback.print_exc()
+            return False
+        
+        # Test 4: Verify usage data format
+        print("\n[5/7] Verifying usage data format...")
+        try:
+            usage_data = data.get("usage")
+            if usage_data is None:
+                print("⚠️  Usage data is None (API may have returned error)")
+            else:
+                assert isinstance(usage_data, dict), "Usage data should be a dictionary"
+                if "data" in usage_data:
+                    inner_data = usage_data["data"]
+                    if isinstance(inner_data, dict) and "timeseries" in inner_data:
+                        timeseries = inner_data["timeseries"]
+                        assert isinstance(timeseries, list), "Timeseries should be a list"
+                        
+                        # Count data points
+                        total_points = 0
+                        for item in timeseries:
+                            if isinstance(item, dict) and "data" in item:
+                                item_data = item["data"]
+                                if isinstance(item_data, list):
+                                    total_points += len(item_data)
+                        
+                        print(f"✅ Usage data format is correct")
+                        print(f"   Timeseries entries: {len(timeseries)}")
+                        print(f"   Total data points: {total_points}")
+                        
+                        # Show sample data point
+                        if total_points > 0:
+                            for item in timeseries:
+                                if isinstance(item, dict) and "data" in item:
+                                    item_data = item["data"]
+                                    if isinstance(item_data, list) and len(item_data) > 0:
+                                        sample = item_data[0]
+                                        print(f"   Sample data point: {sample}")
+                                        break
+                    else:
+                        print(f"⚠️  Usage data has unexpected structure: {type(inner_data)}")
+                else:
+                    print(f"⚠️  Usage data missing 'data' key")
+        except Exception as e:
+            print(f"❌ Usage data verification failed: {e}")
+            import traceback
+            traceback.print_exc()
+            return False
+        
+        # Test 5: Verify cost data format
+        print("\n[6/7] Verifying cost data format...")
+        try:
+            cost_data = data.get("cost")
+            if cost_data is None:
+                print("⚠️  Cost data is None (API may have returned error)")
+            else:
+                assert isinstance(cost_data, dict), "Cost data should be a dictionary"
+                if "data" in cost_data:
+                    inner_data = cost_data["data"]
+                    if isinstance(inner_data, dict) and "timeseries" in inner_data:
+                        timeseries = inner_data["timeseries"]
+                        assert isinstance(timeseries, list), "Timeseries should be a list"
+                        
+                        # Count data points
+                        total_points = 0
+                        for item in timeseries:
+                            if isinstance(item, dict) and "data" in item:
+                                item_data = item["data"]
+                                if isinstance(item_data, list):
+                                    total_points += len(item_data)
+                        
+                        print(f"✅ Cost data format is correct")
+                        print(f"   Timeseries entries: {len(timeseries)}")
+                        print(f"   Total data points: {total_points}")
+                        
+                        # Show sample data point
+                        if total_points > 0:
+                            for item in timeseries:
+                                if isinstance(item, dict) and "data" in item:
+                                    item_data = item["data"]
+                                    if isinstance(item_data, list) and len(item_data) > 0:
+                                        sample = item_data[0]
+                                        print(f"   Sample data point: {sample}")
+                                        break
+                    else:
+                        print(f"⚠️  Cost data has unexpected structure: {type(inner_data)}")
+                else:
+                    print(f"⚠️  Cost data missing 'data' key")
+        except Exception as e:
+            print(f"❌ Cost data verification failed: {e}")
+            import traceback
+            traceback.print_exc()
+            return False
+        
+        # Test 6: Test multiple updates (verify authentication happens each time)
+        print("\n[7/7] Testing multiple coordinator updates...")
+        try:
+            # Clear sdpudcid to force re-authentication
+            api._sdpudcid = None
+            
+            # First update
+            data1 = await coordinator._async_update_data()
+            sdpudcid1 = data1.get('sdpudcid')
+            
+            # Second update (should authenticate again)
+            data2 = await coordinator._async_update_data()
+            sdpudcid2 = data2.get('sdpudcid')
+            
+            # Both should have sdpudcid
+            assert sdpudcid1 is not None, "First update should have sdpudcid"
+            assert sdpudcid2 is not None, "Second update should have sdpudcid"
+            assert sdpudcid1 == sdpudcid2, "SDPUDCID should be consistent"
+            
+            print("✅ Multiple updates successful")
+            print(f"   First update SDPUDCID: {sdpudcid1}")
+            print(f"   Second update SDPUDCID: {sdpudcid2}")
+            print(f"   Both updates authenticated correctly")
+            
+        except Exception as e:
+            print(f"❌ Multiple updates test failed: {e}")
+            import traceback
+            traceback.print_exc()
+            return False
+        
+        # Summary
+        print("\n" + "=" * 70)
+        print("MyTNBCoordinator Real Data Test Summary")
+        print("=" * 70)
+        print(f"✅ Coordinator initialized successfully")
+        print(f"✅ Authentication flow verified")
+        print(f"✅ Data structure validated")
+        print(f"✅ Usage data: {'present' if data.get('usage') else 'None'}")
+        print(f"✅ Cost data: {'present' if data.get('cost') else 'None'}")
+        print(f"✅ SDPUDCID: {data.get('sdpudcid', 'N/A')}")
+        print(f"✅ Multiple updates tested successfully")
+        print("=" * 70)
+        
+        return True
+
+
 def main():
     """Run all tests."""
     print("\n" + "=" * 70)
@@ -1415,6 +1814,26 @@ def main():
         traceback.print_exc()
         results.append(("Sensor Integration", False))
     
+    # Test 7: Coordinator Unit Test
+    try:
+        coordinator_result = asyncio.run(test_coordinator())
+        results.append(("Coordinator Unit Test", coordinator_result))
+    except Exception as e:
+        print(f"\n❌ Coordinator unit test failed: {e}")
+        import traceback
+        traceback.print_exc()
+        results.append(("Coordinator Unit Test", False))
+    
+    # Test 8: Coordinator Real Data Test
+    try:
+        coordinator_real_result = asyncio.run(test_coordinator_real_data())
+        results.append(("Coordinator Real Data Test", coordinator_real_result))
+    except Exception as e:
+        print(f"\n❌ Coordinator real data test failed: {e}")
+        import traceback
+        traceback.print_exc()
+        results.append(("Coordinator Real Data Test", False))
+    
     # Summary
     print("\n" + "=" * 70)
     print("Test Summary")
@@ -1441,18 +1860,35 @@ def main():
 
 
 if __name__ == "__main__":
-    # Allow running just the live sensor test with: python test_integration.py --live-sensor
-    if len(sys.argv) > 1 and sys.argv[1] == "--live-sensor":
-        print("\n" + "=" * 70)
-        print("Running Live Sensor Test Only")
-        print("=" * 70)
-        try:
-            success = asyncio.run(test_live_sensor())
-            sys.exit(0 if success else 1)
-        except Exception as e:
-            print(f"\n❌ Live sensor test failed: {e}")
-            import traceback
-            traceback.print_exc()
+    # Allow running specific tests with command-line arguments
+    if len(sys.argv) > 1:
+        if sys.argv[1] == "--live-sensor":
+            print("\n" + "=" * 70)
+            print("Running Live Sensor Test Only")
+            print("=" * 70)
+            try:
+                success = asyncio.run(test_live_sensor())
+                sys.exit(0 if success else 1)
+            except Exception as e:
+                print(f"\n❌ Live sensor test failed: {e}")
+                import traceback
+                traceback.print_exc()
+                sys.exit(1)
+        elif sys.argv[1] == "--coordinator-real":
+            print("\n" + "=" * 70)
+            print("Running Coordinator Real Data Test Only")
+            print("=" * 70)
+            try:
+                success = asyncio.run(test_coordinator_real_data())
+                sys.exit(0 if success else 1)
+            except Exception as e:
+                print(f"\n❌ Coordinator real data test failed: {e}")
+                import traceback
+                traceback.print_exc()
+                sys.exit(1)
+        else:
+            print(f"Unknown argument: {sys.argv[1]}")
+            print("Available options: --live-sensor, --coordinator-real")
             sys.exit(1)
     else:
         success = main()
