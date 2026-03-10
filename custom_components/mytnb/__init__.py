@@ -50,24 +50,31 @@ async def async_unload_entry(hass: HomeAssistant, entry: MyTNBConfigEntry) -> bo
 async def async_get_config_entry_diagnostics(
     hass: HomeAssistant, entry: MyTNBConfigEntry
 ) -> dict[str, Any]:
-    """Return diagnostics for a config entry."""
+    """Return diagnostics for a config entry.
+    
+    Note: All sensitive data (passwords, usernames, URLs) is redacted
+    using async_redact_data to prevent credential exposure.
+    """
     api = entry.runtime_data
     
     # Gather diagnostic information
+    # Following Home Assistant's recommended pattern from:
+    # https://developers.home-assistant.io/docs/core/integration_diagnostics/
     diagnostics: dict[str, Any] = {
-        "entry": {
+        "entry_data": async_redact_data(entry.data, TO_REDACT),
+        "entry_options": async_redact_data(entry.options, TO_REDACT),
+        "entry_info": {
             "entry_id": entry.entry_id,
             "version": entry.version,
             "domain": entry.domain,
             "title": entry.title,
-            "data": async_redact_data(entry.data, TO_REDACT),
-            "options": async_redact_data(entry.options, TO_REDACT),
             "unique_id": entry.unique_id,
             "state": entry.state.value if entry.state else None,
         },
     }
     
     # Add API state information if available
+    # Note: We never expose credentials from the API instance
     if api:
         api_info: dict[str, Any] = {
             "session_active": api._session is not None and not api._session.closed if api._session else False,
@@ -75,6 +82,7 @@ async def async_get_config_entry_diagnostics(
         }
         
         # Only include cached sdpudcid to avoid making API calls during diagnostics
+        # sdpudcid is a device identifier (not a credential) but included for troubleshooting
         if api._sdpudcid:
             api_info["sdpudcid"] = api._sdpudcid
         
