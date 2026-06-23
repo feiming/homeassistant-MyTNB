@@ -279,19 +279,15 @@ class MyTNBSensor(CoordinatorEntity[MyTNBCoordinator], SensorEntity):
                                 data_points.extend(item_data)
                     
                     if data_points:
-                        # Sort by datetime to get the most recent data point
                         def get_datetime(point):
                             if isinstance(point, dict):
-                                dt = point.get("datetime") or ""
-                                # Handle datetime format "2026-03-02 00:00" for proper sorting
-                                return dt
+                                return point.get("datetime") or ""
                             return ""
-                        
+
                         sorted_points = sorted(data_points, key=get_datetime)
-                        if sorted_points:
-                            latest = sorted_points[-1]
-                            if isinstance(latest, dict) and "value" in latest:
-                                val = latest["value"]
+                        for point in reversed(sorted_points):
+                            if isinstance(point, dict) and "value" in point:
+                                val = point["value"]
                                 if val is not None:
                                     try:
                                         return float(val)
