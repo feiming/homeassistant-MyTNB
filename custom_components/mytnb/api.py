@@ -68,7 +68,9 @@ class MyTNBAPI:
     async def _get_session(self) -> aiohttp.ClientSession:
         """Get or create aiohttp session."""
         if self._session is None or self._session.closed:
-            self._session = aiohttp.ClientSession()
+            self._session = aiohttp.ClientSession(
+                cookie_jar=aiohttp.CookieJar(unsafe=True)
+            )
         return self._session
 
     async def close(self) -> None:
