@@ -42,17 +42,17 @@ _MYT = zoneinfo.ZoneInfo("Asia/Kuala_Lumpur")
 SENSOR_DESCRIPTIONS: tuple[SensorEntityDescription, ...] = (
     SensorEntityDescription(
         key="usage",
-        name="Energy Usage",
+        name="Last Interval Usage",
         device_class=SensorDeviceClass.ENERGY,
         native_unit_of_measurement=UnitOfEnergy.KILO_WATT_HOUR,
-        state_class=SensorStateClass.TOTAL_INCREASING,
+        state_class=SensorStateClass.MEASUREMENT,
         icon="mdi:lightning-bolt",
     ),
     SensorEntityDescription(
         key="cost",
-        name="Energy Cost",
+        name="Last Interval Cost",
         native_unit_of_measurement="MYR",
-        state_class=SensorStateClass.TOTAL_INCREASING,
+        state_class=SensorStateClass.MEASUREMENT,
         icon="mdi:currency-usd",
     ),
 )
@@ -164,8 +164,8 @@ class MyTNBCoordinator(DataUpdateCoordinator[dict[str, Any]]):
     def _import_statistics(self, data: dict[str, Any]) -> None:
         """Push timeseries data into HA long-term statistics for Energy dashboard."""
         targets = [
-            ("usage", f"{DOMAIN}:energy_usage_{self.entry.entry_id}", "MyTNB Energy Usage", UnitOfEnergy.KILO_WATT_HOUR),
-            ("cost",  f"{DOMAIN}:energy_cost_{self.entry.entry_id}",  "MyTNB Energy Cost",  "MYR"),
+            ("usage", f"{DOMAIN}:energy_usage_{self.entry.entry_id}", "MyTNB Monthly Usage", UnitOfEnergy.KILO_WATT_HOUR),
+            ("cost",  f"{DOMAIN}:energy_cost_{self.entry.entry_id}",  "MyTNB Monthly Cost",  "MYR"),
         ]
         for metric_key, statistic_id, name, unit in targets:
             if not data.get(metric_key):
@@ -211,7 +211,7 @@ class MyTNBSensor(CoordinatorEntity[MyTNBCoordinator], SensorEntity):
 
     @property
     def native_value(self) -> float | None:
-        """Return cumulative sum of all fetched data points as the sensor state."""
+        """Return the most recent non-null 30-min interval value."""
         if self.coordinator.data is None:
             return None
         metric_data = self.coordinator.data.get(self.entity_description.key)
@@ -220,7 +220,8 @@ class MyTNBSensor(CoordinatorEntity[MyTNBCoordinator], SensorEntity):
         points = self.coordinator._extract_points(metric_data)
         if not points:
             return None
-        return round(sum(val for _, val in points), 6)
+        _, val = points[-1]
+        return round(val, 6)
 
     @property
     def extra_state_attributes(self) -> dict[str, Any]:
