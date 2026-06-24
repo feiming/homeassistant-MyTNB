@@ -5,7 +5,7 @@
     "@feiming"
   ],
   "config_flow": true,
-  "dependencies": [],
+  "dependencies": ["recorder"],
   "documentation": "https://github.com/feiming/homeassistant-MyTNB",
   "homekit": {},
   "iot_class": "cloud_polling",

@@ -6,8 +6,12 @@ from datetime import datetime, timedelta
 import logging
 import time
 from typing import Any
+import zoneinfo
 
+from homeassistant.components.recorder.models import StatisticData, StatisticMetaData
+from homeassistant.components.recorder.statistics import async_import_statistics
 from homeassistant.components.sensor import (
+    SensorDeviceClass,
     SensorEntity,
     SensorEntityDescription,
     SensorStateClass,
@@ -33,11 +37,13 @@ from .const import (
 )
 
 _LOGGER = logging.getLogger(__name__)
+_MYT = zoneinfo.ZoneInfo("Asia/Kuala_Lumpur")
 
 SENSOR_DESCRIPTIONS: tuple[SensorEntityDescription, ...] = (
     SensorEntityDescription(
         key="usage",
         name="Energy Usage",
+        device_class=SensorDeviceClass.ENERGY,
         native_unit_of_measurement=UnitOfEnergy.KILO_WATT_HOUR,
         state_class=SensorStateClass.TOTAL_INCREASING,
         icon="mdi:lightning-bolt",
@@ -58,11 +64,9 @@ async def async_setup_entry(
     async_add_entities: AddEntitiesCallback,
 ) -> None:
     """Set up MyTNB sensors from a config entry."""
-    # Get API from runtime_data (set in __init__.py)
     api: MyTNBAPI = entry.runtime_data
 
     coordinator = MyTNBCoordinator(hass, api, entry)
-
     await coordinator.async_config_entry_first_refresh()
 
     async_add_entities(
@@ -87,154 +91,108 @@ class MyTNBCoordinator(DataUpdateCoordinator[dict[str, Any]]):
     async def _async_update_data(self) -> dict[str, Any]:
         """Fetch data from MyTNB API."""
         start_time = time.time()
-        _LOGGER.debug("Starting data update")
-        
-        # Authenticate (login and access smartmeter) before fetching data
-        auth_start = time.time()
+
         try:
-            _LOGGER.debug("Authenticating with MyTNB API...")
             if not await self.api.authenticate():
                 raise Exception("Authentication failed")
-            auth_duration = time.time() - auth_start
-            _LOGGER.debug("Authentication successful (took %.2f seconds)", auth_duration)
         except Exception as err:
-            auth_duration = time.time() - auth_start
-            _LOGGER.error("Error authenticating (took %.2f seconds): %s", auth_duration, err)
+            _LOGGER.error("Error authenticating: %s", err)
             raise
 
-        end_date = datetime.now()
-        start_date = end_date - timedelta(days=7)
+        # Fetch from start of current month to cover the full billing period
+        now = datetime.now()
+        start_date = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
         start_str = start_date.strftime("%Y-%m-%d+00:00")
-        end_str = end_date.strftime("%Y-%m-%d+00:00")
-        
+        end_str = now.strftime("%Y-%m-%d+00:00")
+
         _LOGGER.debug(
-            "Fetching data for date range: %s to %s (view=%s, granularity=%s)",
-            start_str,
-            end_str,
-            DEFAULT_VIEW,
-            DEFAULT_GRANULARITY,
+            "Fetching data %s to %s (view=%s, granularity=%s)",
+            start_str, end_str, DEFAULT_VIEW, DEFAULT_GRANULARITY,
         )
 
         data: dict[str, Any] = {}
-        metric_durations: dict[str, float] = {}
 
         for metric in ["usage", "cost"]:
-            metric_start = time.time()
             try:
-                _LOGGER.debug("Fetching %s data...", metric)
                 result = await self.api.get_data(
-                    metric,
-                    DEFAULT_VIEW,
-                    DEFAULT_GRANULARITY,
-                    start_str,
-                    end_str,
+                    metric, DEFAULT_VIEW, DEFAULT_GRANULARITY, start_str, end_str
                 )
-                metric_duration = time.time() - metric_start
-                metric_durations[metric] = metric_duration
-                
-                # Debug: Analyze result structure
-                if isinstance(result, dict):
-                    if "data" in result:
-                        inner_data = result["data"]
-                        if isinstance(inner_data, dict) and "timeseries" in inner_data:
-                            timeseries = inner_data["timeseries"]
-                            if isinstance(timeseries, list):
-                                total_points = sum(
-                                    len(item.get("data", []))
-                                    for item in timeseries
-                                    if isinstance(item, dict) and "data" in item
-                                )
-                                _LOGGER.debug(
-                                    "%s data retrieved: %d timeseries entries, %d total data points (took %.2f seconds)",
-                                    metric.capitalize(),
-                                    len(timeseries),
-                                    total_points,
-                                    metric_duration,
-                                )
-                                
-                                # Log sample data point if available
-                                for item in timeseries:
-                                    if isinstance(item, dict) and "data" in item:
-                                        item_data = item["data"]
-                                        if isinstance(item_data, list) and len(item_data) > 0:
-                                            sample = item_data[0]
-                                            _LOGGER.debug(
-                                                "%s sample data point: %s",
-                                                metric.capitalize(),
-                                                sample,
-                                            )
-                                            break
-                            else:
-                                _LOGGER.debug(
-                                    "%s data structure: timeseries is not a list (type: %s)",
-                                    metric.capitalize(),
-                                    type(timeseries).__name__,
-                                )
-                        else:
-                            _LOGGER.debug(
-                                "%s data structure: unexpected format, keys: %s",
-                                metric.capitalize(),
-                                list(inner_data.keys()) if isinstance(inner_data, dict) else type(inner_data).__name__,
-                            )
-                    else:
-                        _LOGGER.debug(
-                            "%s data: missing 'data' key, keys: %s",
-                            metric.capitalize(),
-                            list(result.keys()),
-                        )
-                else:
-                    _LOGGER.debug(
-                        "%s data: unexpected type %s",
-                        metric.capitalize(),
-                        type(result).__name__,
-                    )
-                
                 data[metric] = result
+                points = self._extract_points(result)
+                _LOGGER.debug("%s: %d data points fetched", metric, len(points))
             except Exception as err:
-                metric_duration = time.time() - metric_start
-                metric_durations[metric] = metric_duration
-                _LOGGER.error(
-                    "Error fetching %s data (took %.2f seconds): %s",
-                    metric,
-                    metric_duration,
-                    err,
-                )
+                _LOGGER.error("Error fetching %s data: %s", metric, err)
                 data[metric] = None
 
-        # Get sdpudcid for attributes
-        sdpudcid_start = time.time()
         try:
-            _LOGGER.debug("Fetching sdpudcid...")
-            sdpudcid = await self.api.get_sdpudcid()
-            sdpudcid_duration = time.time() - sdpudcid_start
-            _LOGGER.debug("SDPUDCID retrieved: %s (took %.2f seconds)", sdpudcid, sdpudcid_duration)
-            data["sdpudcid"] = sdpudcid
+            data["sdpudcid"] = await self.api.get_sdpudcid()
         except Exception as err:
-            sdpudcid_duration = time.time() - sdpudcid_start
-            _LOGGER.error("Error fetching sdpudcid (took %.2f seconds): %s", sdpudcid_duration, err)
+            _LOGGER.error("Error fetching sdpudcid: %s", err)
             data["sdpudcid"] = None
 
-        total_duration = time.time() - start_time
-        usage_duration = metric_durations.get("usage", 0.0)
-        cost_duration = metric_durations.get("cost", 0.0)
-        _LOGGER.debug(
-            "Data update completed in %.2f seconds (auth: %.2fs, usage: %.2fs, cost: %.2fs, sdpudcid: %.2fs)",
-            total_duration,
-            auth_duration,
-            usage_duration,
-            cost_duration,
-            sdpudcid_duration if "sdpudcid" in data else 0.0,
-        )
-        
-        # Summary of retrieved data
-        _LOGGER.debug(
-            "Update summary: usage=%s, cost=%s, sdpudcid=%s",
-            "present" if data.get("usage") else "None",
-            "present" if data.get("cost") else "None",
-            data.get("sdpudcid", "None"),
-        )
+        self._import_statistics(data)
 
+        _LOGGER.debug("Data update completed in %.2f seconds", time.time() - start_time)
         return data
+
+    def _extract_points(self, metric_data: Any) -> list[tuple[datetime, float]]:
+        """Extract sorted (datetime, value) pairs from API response, skipping nulls."""
+        points: list[tuple[datetime, float]] = []
+        if not isinstance(metric_data, dict) or "data" not in metric_data:
+            return points
+        inner = metric_data["data"]
+        if not isinstance(inner, dict) or "timeseries" not in inner:
+            return points
+        for item in inner.get("timeseries", []):
+            if not isinstance(item, dict):
+                continue
+            for point in item.get("data", []):
+                if not isinstance(point, dict):
+                    continue
+                val = point.get("value")
+                dt_str = point.get("datetime")
+                if val is None or not dt_str:
+                    continue
+                try:
+                    dt = datetime.strptime(dt_str, "%Y-%m-%d %H:%M").replace(tzinfo=_MYT)
+                    points.append((dt, float(val)))
+                except (ValueError, TypeError):
+                    pass
+        points.sort(key=lambda x: x[0])
+        return points
+
+    def _import_statistics(self, data: dict[str, Any]) -> None:
+        """Push timeseries data into HA long-term statistics for Energy dashboard."""
+        targets = [
+            ("usage", f"{DOMAIN}:energy_usage_{self.entry.entry_id}", "MyTNB Energy Usage", UnitOfEnergy.KILO_WATT_HOUR),
+            ("cost",  f"{DOMAIN}:energy_cost_{self.entry.entry_id}",  "MyTNB Energy Cost",  "MYR"),
+        ]
+        for metric_key, statistic_id, name, unit in targets:
+            if not data.get(metric_key):
+                continue
+            points = self._extract_points(data[metric_key])
+            if not points:
+                continue
+
+            cumulative = 0.0
+            statistics: list[StatisticData] = []
+            for dt, val in points:
+                cumulative += val
+                statistics.append(StatisticData(start=dt, state=val, sum=cumulative))
+
+            metadata = StatisticMetaData(
+                has_mean=False,
+                has_sum=True,
+                name=name,
+                source=DOMAIN,
+                statistic_id=statistic_id,
+                unit_of_measurement=unit,
+            )
+            try:
+                async_import_statistics(self.hass, metadata, statistics)
+                _LOGGER.debug("Imported %d %s statistics", len(statistics), metric_key)
+            except Exception as err:
+                _LOGGER.warning("Failed to import %s statistics: %s", metric_key, err)
 
 
 class MyTNBSensor(CoordinatorEntity[MyTNBCoordinator], SensorEntity):
@@ -253,49 +211,16 @@ class MyTNBSensor(CoordinatorEntity[MyTNBCoordinator], SensorEntity):
 
     @property
     def native_value(self) -> float | None:
-        """Return the state of the sensor."""
+        """Return cumulative sum of all fetched data points as the sensor state."""
         if self.coordinator.data is None:
             return None
-
         metric_data = self.coordinator.data.get(self.entity_description.key)
         if metric_data is None:
             return None
-
-        # Extract the latest value from the timeseries data
-        # The API returns data in format: {"data": {"timeseries": [{"data": [{"datetime": "...", "value": ...}], ...}, ...], ...}}
-        
-        # Handle nested structure: {"data": {"timeseries": [...]}}
-        if isinstance(metric_data, dict) and "data" in metric_data:
-            inner_data = metric_data["data"]
-            if isinstance(inner_data, dict) and "timeseries" in inner_data:
-                timeseries = inner_data["timeseries"]
-                if isinstance(timeseries, list) and len(timeseries) > 0:
-                    # Flatten timeseries into a list of data points
-                    data_points = []
-                    for item in timeseries:
-                        if isinstance(item, dict) and "data" in item:
-                            item_data = item["data"]
-                            if isinstance(item_data, list) and len(item_data) > 0:
-                                data_points.extend(item_data)
-                    
-                    if data_points:
-                        def get_datetime(point):
-                            if isinstance(point, dict):
-                                return point.get("datetime") or ""
-                            return ""
-
-                        sorted_points = sorted(data_points, key=get_datetime)
-                        for point in reversed(sorted_points):
-                            if isinstance(point, dict) and "value" in point:
-                                val = point["value"]
-                                if val is not None:
-                                    try:
-                                        return float(val)
-                                    except (ValueError, TypeError):
-                                        _LOGGER.warning("Could not convert value to float: %s", val)
-                                        return None
-
-        return None
+        points = self.coordinator._extract_points(metric_data)
+        if not points:
+            return None
+        return round(sum(val for _, val in points), 6)
 
     @property
     def extra_state_attributes(self) -> dict[str, Any]:
