@@ -113,7 +113,7 @@ class MyTNBCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
         # Fetch last 3 months to populate Energy dashboard history
         now = datetime.now()
-        start_date = now - timedelta(days=90)
+        start_date = now - timedelta(days=30)
         start_str = start_date.strftime("%Y-%m-%d+00:00")
         end_str = now.strftime("%Y-%m-%d+00:00")
 
