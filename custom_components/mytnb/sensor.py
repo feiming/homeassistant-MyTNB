@@ -40,15 +40,29 @@ _MYT = zoneinfo.ZoneInfo("Asia/Kuala_Lumpur")
 
 SENSOR_DESCRIPTIONS: tuple[SensorEntityDescription, ...] = (
     SensorEntityDescription(
-        key="usage",
-        name="Last Interval Usage",
+        key="usage_latest",
+        name="Latest Usage",
         native_unit_of_measurement=UnitOfEnergy.KILO_WATT_HOUR,
         state_class=SensorStateClass.MEASUREMENT,
         icon="mdi:lightning-bolt",
     ),
     SensorEntityDescription(
-        key="cost",
-        name="Last Interval Cost",
+        key="cost_latest",
+        name="Latest Cost",
+        native_unit_of_measurement="MYR",
+        state_class=SensorStateClass.MEASUREMENT,
+        icon="mdi:currency-usd",
+    ),
+    SensorEntityDescription(
+        key="usage_monthly",
+        name="Monthly Usage",
+        native_unit_of_measurement=UnitOfEnergy.KILO_WATT_HOUR,
+        state_class=SensorStateClass.MEASUREMENT,
+        icon="mdi:lightning-bolt",
+    ),
+    SensorEntityDescription(
+        key="cost_monthly",
+        name="Monthly Cost",
         native_unit_of_measurement="MYR",
         state_class=SensorStateClass.MEASUREMENT,
         icon="mdi:currency-usd",
@@ -97,9 +111,9 @@ class MyTNBCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             _LOGGER.error("Error authenticating: %s", err)
             raise
 
-        # Fetch from start of current month to cover the full billing period
+        # Fetch last 3 months to populate Energy dashboard history
         now = datetime.now()
-        start_date = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+        start_date = now - timedelta(days=90)
         start_str = start_date.strftime("%Y-%m-%d+00:00")
         end_str = now.strftime("%Y-%m-%d+00:00")
 
@@ -111,9 +125,11 @@ class MyTNBCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         data: dict[str, Any] = {}
 
         for metric in ["usage", "cost"]:
+            # Cost API does not support MIN30 granularity
+            granularity = DEFAULT_GRANULARITY if metric == "usage" else None
             try:
                 result = await self.api.get_data(
-                    metric, DEFAULT_VIEW, DEFAULT_GRANULARITY, start_str, end_str
+                    metric, DEFAULT_VIEW, granularity, start_str, end_str
                 )
                 data[metric] = result
                 points = self._extract_points(result)
@@ -158,6 +174,12 @@ class MyTNBCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                     pass
         points.sort(key=lambda x: x[0])
         return points
+
+    def _monthly_points(self, metric_data: Any) -> list[tuple[datetime, float]]:
+        """Extract points for the current calendar month only."""
+        now = datetime.now(_MYT)
+        month_start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+        return [(dt, val) for dt, val in self._extract_points(metric_data) if dt >= month_start]
 
     def _import_statistics(self, data: dict[str, Any]) -> None:
         """Push timeseries data into HA long-term statistics for Energy dashboard."""
@@ -207,28 +229,47 @@ class MyTNBSensor(CoordinatorEntity[MyTNBCoordinator], SensorEntity):
         self.entity_description = description
         self._attr_unique_id = f"{entry.entry_id}_{description.key}"
 
+    def _metric_and_agg(self) -> tuple[str, str]:
+        """Parse key into (metric, aggregation): e.g. 'usage_latest' -> ('usage', 'latest')."""
+        metric, agg = self.entity_description.key.rsplit("_", 1)
+        return metric, agg
+
     @property
     def native_value(self) -> float | None:
-        """Return the most recent non-null 30-min interval value."""
         if self.coordinator.data is None:
             return None
-        metric_data = self.coordinator.data.get(self.entity_description.key)
+        metric, agg = self._metric_and_agg()
+        metric_data = self.coordinator.data.get(metric)
         if metric_data is None:
             return None
-        points = self.coordinator._extract_points(metric_data)
-        if not points:
-            return None
-        _, val = points[-1]
-        return round(val, 6)
+        if agg == "latest":
+            points = self.coordinator._extract_points(metric_data)
+            if not points:
+                return None
+            _, val = points[-1]
+            return round(val, 6)
+        else:  # monthly
+            points = self.coordinator._monthly_points(metric_data)
+            if not points:
+                return None
+            return round(sum(v for _, v in points), 6)
 
     @property
     def extra_state_attributes(self) -> dict[str, Any]:
         """Return extra state attributes."""
         attrs: dict[str, Any] = {}
-        if self.coordinator.data:
-            if sdpudcid := self.coordinator.data.get("sdpudcid"):
-                attrs[ATTR_SDPUDCID] = sdpudcid
-            attrs[ATTR_METRIC] = self.entity_description.key
-            attrs[ATTR_VIEW] = DEFAULT_VIEW
-            attrs[ATTR_GRANULARITY] = DEFAULT_GRANULARITY
+        if self.coordinator.data is None:
+            return attrs
+        metric, agg = self._metric_and_agg()
+        if sdpudcid := self.coordinator.data.get("sdpudcid"):
+            attrs[ATTR_SDPUDCID] = sdpudcid
+        attrs[ATTR_METRIC] = metric
+        attrs[ATTR_VIEW] = DEFAULT_VIEW
+        attrs[ATTR_GRANULARITY] = DEFAULT_GRANULARITY if metric == "usage" else "default"
+        metric_data = self.coordinator.data.get(metric)
+        if metric_data is not None:
+            points = self.coordinator._extract_points(metric_data)
+            if points:
+                latest_dt, _ = points[-1]
+                attrs["data_as_of"] = latest_dt.isoformat()
         return attrs
