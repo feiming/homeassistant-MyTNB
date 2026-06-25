@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta
 import logging
+import re
 import time
 from typing import Any
 import zoneinfo
@@ -183,7 +184,7 @@ class MyTNBCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
     def _import_statistics(self, data: dict[str, Any]) -> None:
         """Push timeseries data into HA long-term statistics for Energy dashboard."""
-        safe_id = self.entry.entry_id.replace("-", "_").lower()
+        safe_id = re.sub(r"_+", "_", self.entry.entry_id.replace("-", "_").lower()).strip("_")
         targets = [
             ("usage", f"{DOMAIN}:energy_usage_{safe_id}", "MyTNB Monthly Usage", UnitOfEnergy.KILO_WATT_HOUR),
             ("cost",  f"{DOMAIN}:energy_cost_{safe_id}",  "MyTNB Monthly Cost",  "MYR"),
