@@ -183,7 +183,7 @@ class MyTNBCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
     def _import_statistics(self, data: dict[str, Any]) -> None:
         """Push timeseries data into HA long-term statistics for Energy dashboard."""
-        safe_id = self.entry.entry_id.replace("-", "_")
+        safe_id = self.entry.entry_id.replace("-", "_").lower()
         targets = [
             ("usage", f"{DOMAIN}:energy_usage_{safe_id}", "MyTNB Monthly Usage", UnitOfEnergy.KILO_WATT_HOUR),
             ("cost",  f"{DOMAIN}:energy_cost_{safe_id}",  "MyTNB Monthly Cost",  "MYR"),
