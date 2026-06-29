@@ -239,14 +239,19 @@ class MyTNBAPI:
     async def authenticate(self) -> bool:
         """Authenticate and initialize session."""
         _LOGGER.debug("Starting authentication flow")
-        
+
+        if self._session and not self._session.closed:
+            await self._session.close()
+        self._session = None
+        self._sdpudcid = None
+
         if not await self.login():
             _LOGGER.debug("Authentication failed at login step")
             return False
-        
+
         if not await self.access_smartmeter():
             _LOGGER.debug("Authentication failed at smartmeter access step")
             return False
-        
+
         _LOGGER.debug("Authentication flow completed successfully")
         return True
