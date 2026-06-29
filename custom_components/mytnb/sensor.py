@@ -189,6 +189,7 @@ class MyTNBCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             ("usage", f"{DOMAIN}:energy_usage_{safe_id}", "MyTNB Monthly Usage", UnitOfEnergy.KILO_WATT_HOUR),
             ("cost",  f"{DOMAIN}:energy_cost_{safe_id}",  "MyTNB Monthly Cost",  "MYR"),
         ]
+        _LOGGER.warning("statistic_ids: %s", [sid for _, sid, _, _ in targets])
         for metric_key, statistic_id, name, unit in targets:
             if not data.get(metric_key):
                 continue
