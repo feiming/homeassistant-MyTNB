@@ -110,11 +110,11 @@ class MyTNBCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             _LOGGER.error("Error authenticating: %s", err)
             raise
 
-        # Fetch last 3 months to populate Energy dashboard history
         now = datetime.now()
         start_date = now - timedelta(days=30)
+        end_date = now + timedelta(days=1)
         start_str = start_date.strftime("%Y-%m-%d+00:00")
-        end_str = now.strftime("%Y-%m-%d+00:00")
+        end_str = end_date.strftime("%Y-%m-%d+00:00")
 
         _LOGGER.debug(
             "Fetching data %s to %s (view=%s, granularity=%s)",
