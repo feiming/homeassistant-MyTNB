@@ -4,21 +4,22 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta
 import logging
-import re
 import time
 from typing import Any
 import zoneinfo
 
+from homeassistant.components.recorder import DOMAIN as RECORDER_DOMAIN
 from homeassistant.components.recorder.models import StatisticData, StatisticMetaData
 from homeassistant.components.recorder.statistics import async_import_statistics
 from homeassistant.components.sensor import (
+    SensorDeviceClass,
     SensorEntity,
     SensorEntityDescription,
     SensorStateClass,
 )
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import UnitOfEnergy
-from homeassistant.core import HomeAssistant
+from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.update_coordinator import (
     CoordinatorEntity,
@@ -66,6 +67,21 @@ SENSOR_DESCRIPTIONS: tuple[SensorEntityDescription, ...] = (
         name="Monthly Cost",
         native_unit_of_measurement="MYR",
         state_class=SensorStateClass.MEASUREMENT,
+        icon="mdi:currency-usd",
+    ),
+    SensorEntityDescription(
+        key="usage_total",
+        name="Energy Usage",
+        native_unit_of_measurement=UnitOfEnergy.KILO_WATT_HOUR,
+        device_class=SensorDeviceClass.ENERGY,
+        state_class=SensorStateClass.TOTAL_INCREASING,
+        icon="mdi:lightning-bolt",
+    ),
+    SensorEntityDescription(
+        key="cost_total",
+        name="Energy Cost",
+        native_unit_of_measurement="MYR",
+        state_class=SensorStateClass.TOTAL_INCREASING,
         icon="mdi:currency-usd",
     ),
 )
@@ -145,8 +161,6 @@ class MyTNBCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             _LOGGER.error("Error fetching sdpudcid: %s", err)
             data["sdpudcid"] = None
 
-        self._import_statistics(data)
-
         _LOGGER.debug("Data update completed in %.2f seconds", time.time() - start_time)
         return data
 
@@ -182,41 +196,6 @@ class MyTNBCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         month_start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
         return [(dt, val) for dt, val in self._extract_points(metric_data) if dt >= month_start]
 
-    def _import_statistics(self, data: dict[str, Any]) -> None:
-        """Push timeseries data into HA long-term statistics for Energy dashboard."""
-        safe_id = re.sub(r"_+", "_", self.entry.entry_id.replace("-", "_").lower()).strip("_")
-        targets = [
-            ("usage", f"{DOMAIN}:energy_usage_{safe_id}", "MyTNB Monthly Usage", UnitOfEnergy.KILO_WATT_HOUR),
-            ("cost",  f"{DOMAIN}:energy_cost_{safe_id}",  "MyTNB Monthly Cost",  "MYR"),
-        ]
-        _LOGGER.warning("statistic_ids: %s", [sid for _, sid, _, _ in targets])
-        for metric_key, statistic_id, name, unit in targets:
-            if not data.get(metric_key):
-                continue
-            points = self._extract_points(data[metric_key])
-            if not points:
-                continue
-
-            cumulative = 0.0
-            statistics: list[StatisticData] = []
-            for dt, val in points:
-                cumulative += val
-                statistics.append(StatisticData(start=dt, state=val, sum=cumulative))
-
-            metadata = StatisticMetaData(
-                has_mean=False,
-                has_sum=True,
-                name=name,
-                source=DOMAIN,
-                statistic_id=statistic_id,
-                unit_of_measurement=unit,
-            )
-            try:
-                async_import_statistics(self.hass, metadata, statistics)
-                _LOGGER.debug("Imported %d %s statistics", len(statistics), metric_key)
-            except Exception as err:
-                _LOGGER.warning("Failed to import %s statistics: %s", metric_key, err)
-
 
 class MyTNBSensor(CoordinatorEntity[MyTNBCoordinator], SensorEntity):
     """Representation of a MyTNB sensor."""
@@ -237,6 +216,43 @@ class MyTNBSensor(CoordinatorEntity[MyTNBCoordinator], SensorEntity):
         metric, agg = self.entity_description.key.rsplit("_", 1)
         return metric, agg
 
+    @callback
+    def _handle_coordinator_update(self) -> None:
+        super()._handle_coordinator_update()
+        if self.entity_description.key in ("usage_total", "cost_total") and self.entity_id:
+            self._import_statistics()
+
+    def _import_statistics(self) -> None:
+        if not self.coordinator.data:
+            return
+        metric, _ = self._metric_and_agg()
+        metric_data = self.coordinator.data.get(metric)
+        if not metric_data:
+            return
+        points = self.coordinator._extract_points(metric_data)
+        if not points:
+            return
+
+        cumulative = 0.0
+        statistics: list[StatisticData] = []
+        for dt, val in points:
+            cumulative += val
+            statistics.append(StatisticData(start=dt, state=val, sum=cumulative))
+
+        metadata = StatisticMetaData(
+            has_mean=False,
+            has_sum=True,
+            name=self.entity_description.name,
+            source=RECORDER_DOMAIN,
+            statistic_id=self.entity_id,
+            unit_of_measurement=self.entity_description.native_unit_of_measurement,
+        )
+        try:
+            async_import_statistics(self.hass, metadata, statistics)
+            _LOGGER.debug("Imported %d %s statistics for %s", len(statistics), metric, self.entity_id)
+        except Exception as err:
+            _LOGGER.warning("Failed to import %s statistics: %s", metric, err)
+
     @property
     def native_value(self) -> float | None:
         if self.coordinator.data is None:
@@ -251,6 +267,11 @@ class MyTNBSensor(CoordinatorEntity[MyTNBCoordinator], SensorEntity):
                 return None
             _, val = points[-1]
             return round(val, 6)
+        elif agg == "total":
+            points = self.coordinator._extract_points(metric_data)
+            if not points:
+                return None
+            return round(sum(v for _, v in points), 6)
         else:  # monthly
             points = self.coordinator._monthly_points(metric_data)
             if not points:
