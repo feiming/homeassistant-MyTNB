@@ -8,14 +8,18 @@ import time
 from typing import Any
 import zoneinfo
 
+from homeassistant.components.recorder import DOMAIN as RECORDER_DOMAIN
+from homeassistant.components.recorder.models import StatisticData, StatisticMetaData
+from homeassistant.components.recorder.statistics import async_import_statistics
 from homeassistant.components.sensor import (
+    SensorDeviceClass,
     SensorEntity,
     SensorEntityDescription,
     SensorStateClass,
 )
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import CONF_USERNAME, UnitOfEnergy
-from homeassistant.core import HomeAssistant
+from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.device_registry import DeviceInfo
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.update_coordinator import (
@@ -64,6 +68,21 @@ SENSOR_DESCRIPTIONS: tuple[SensorEntityDescription, ...] = (
         name="Monthly Cost",
         native_unit_of_measurement="MYR",
         state_class=SensorStateClass.MEASUREMENT,
+        icon="mdi:currency-usd",
+    ),
+    SensorEntityDescription(
+        key="usage_history",
+        name="Usage History",
+        native_unit_of_measurement=UnitOfEnergy.KILO_WATT_HOUR,
+        device_class=SensorDeviceClass.ENERGY,
+        state_class=SensorStateClass.TOTAL_INCREASING,
+        icon="mdi:lightning-bolt",
+    ),
+    SensorEntityDescription(
+        key="cost_history",
+        name="Cost History",
+        native_unit_of_measurement="MYR",
+        state_class=SensorStateClass.TOTAL_INCREASING,
         icon="mdi:currency-usd",
     ),
 )
@@ -203,6 +222,40 @@ class MyTNBSensor(CoordinatorEntity[MyTNBCoordinator], SensorEntity):
         metric, agg = self.entity_description.key.rsplit("_", 1)
         return metric, agg
 
+    @callback
+    def _handle_coordinator_update(self) -> None:
+        super()._handle_coordinator_update()
+        if self.entity_description.key in ("usage_history", "cost_history") and self.entity_id:
+            self._import_statistics()
+
+    def _import_statistics(self) -> None:
+        if not self.coordinator.data:
+            return
+        metric, _ = self._metric_and_agg()
+        points = self.coordinator._extract_points(self.coordinator.data.get(metric))
+        if not points:
+            return
+
+        cumulative = 0.0
+        stats: list[StatisticData] = []
+        for dt, val in points:
+            cumulative += val
+            stats.append(StatisticData(start=dt, state=val, sum=cumulative))
+
+        metadata = StatisticMetaData(
+            has_mean=False,
+            has_sum=True,
+            name=self.entity_description.name,
+            source=RECORDER_DOMAIN,
+            statistic_id=self.entity_id,
+            unit_of_measurement=self.entity_description.native_unit_of_measurement,
+        )
+        try:
+            async_import_statistics(self.hass, metadata, stats)
+            _LOGGER.debug("Imported %d %s intervals for %s", len(stats), metric, self.entity_id)
+        except Exception as err:
+            _LOGGER.warning("Failed to import %s statistics: %s", metric, err)
+
     @property
     def native_value(self) -> float | None:
         if self.coordinator.data is None:
@@ -212,6 +265,12 @@ class MyTNBSensor(CoordinatorEntity[MyTNBCoordinator], SensorEntity):
         if metric_data is None:
             return None
         if agg == "latest":
+            points = self.coordinator._extract_points(metric_data)
+            if not points:
+                return None
+            _, val = points[-1]
+            return round(val, 6)
+        elif agg == "history":
             points = self.coordinator._extract_points(metric_data)
             if not points:
                 return None
