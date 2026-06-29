@@ -14,8 +14,9 @@ from homeassistant.components.sensor import (
     SensorStateClass,
 )
 from homeassistant.config_entries import ConfigEntry
-from homeassistant.const import UnitOfEnergy
+from homeassistant.const import CONF_USERNAME, UnitOfEnergy
 from homeassistant.core import HomeAssistant
+from homeassistant.helpers.device_registry import DeviceInfo
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.update_coordinator import (
     CoordinatorEntity,
@@ -191,6 +192,11 @@ class MyTNBSensor(CoordinatorEntity[MyTNBCoordinator], SensorEntity):
         super().__init__(coordinator)
         self.entity_description = description
         self._attr_unique_id = f"{entry.entry_id}_{description.key}"
+        self._attr_device_info = DeviceInfo(
+            identifiers={(DOMAIN, entry.entry_id)},
+            name=f"MyTNB ({entry.data[CONF_USERNAME]})",
+            manufacturer="Tenaga Nasional Berhad",
+        )
 
     def _metric_and_agg(self) -> tuple[str, str]:
         """Parse key into (metric, aggregation): e.g. 'usage_latest' -> ('usage', 'latest')."""
