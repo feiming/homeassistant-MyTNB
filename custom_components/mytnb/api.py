@@ -253,5 +253,11 @@ class MyTNBAPI:
             _LOGGER.debug("Authentication failed at smartmeter access step")
             return False
 
+        try:
+            await self.get_sdpudcid()
+        except Exception as err:
+            _LOGGER.debug("Authentication failed at smartliving session step: %s", err)
+            return False
+
         _LOGGER.debug("Authentication flow completed successfully")
         return True
