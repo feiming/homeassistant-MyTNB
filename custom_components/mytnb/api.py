@@ -54,6 +54,10 @@ def _redact_dict(data: dict[str, Any]) -> dict[str, Any]:
     return redacted
 
 
+class MyTNBAuthError(Exception):
+    """Raised when the MyTNB session is missing, expired, or rejected."""
+
+
 class MyTNBAPI:
     """API client for MyTNB."""
 
@@ -111,10 +115,14 @@ class MyTNBAPI:
         url = "https://myaccount.mytnb.com.my/SSO/SSOHandler"
         payload = await self.get_login_details()
         
+        if not payload:
+            _LOGGER.warning("Login page returned no form fields; credentials may be rejected")
+            return False
+
         _LOGGER.debug("Logging in to: %s", url)
         # Only log payload keys, never values (may contain sensitive form data)
         _LOGGER.debug("Login payload keys: %s", list(payload.keys()))
-        
+
         async with session.post(url, data=payload) as response:
             status = response.status
             _LOGGER.debug("Login response: status=%d, url=%s", status, _redact_url(str(response.url)))
@@ -173,13 +181,14 @@ class MyTNBAPI:
                 _LOGGER.debug("Extracted sdpudcid: %s", self._sdpudcid)
                 return self._sdpudcid
             
-            # Log more details for debugging
+            # A dashboard page without sdpudcid is almost always the login
+            # redirect, i.e. the session is missing or expired.
             _LOGGER.warning(
                 "Could not find sdpudcid in dashboard response. Status: %s, Response length: %d",
                 response.status,
                 len(text) if text else 0,
             )
-            raise ValueError("Could not find sdpudcid in dashboard response")
+            raise MyTNBAuthError("Could not find sdpudcid in dashboard response (session expired?)")
 
     async def get_data(
         self,
@@ -228,13 +237,20 @@ class MyTNBAPI:
             query_params["end"] = end
 
         async with session.get(url, headers=headers, params=query_params) as response:
+            if response.status in (401, 403):
+                raise MyTNBAuthError(f"Timeseries request rejected with status {response.status}")
             response.raise_for_status()
-            
+
             # Debug: log the actual URL and params being sent (with sensitive data redacted)
             _LOGGER.debug("API request URL: %s", _redact_url(str(response.url)))
             _LOGGER.debug("Query params: %s", _redact_dict(query_params))
-            
-            return await response.json()
+
+            try:
+                return await response.json()
+            except aiohttp.ContentTypeError as err:
+                # An expired session gets redirected to the HTML login page
+                # with status 200, so a non-JSON body means we must re-login.
+                raise MyTNBAuthError("Timeseries endpoint returned non-JSON (session expired?)") from err
 
     async def authenticate(self) -> bool:
         """Authenticate and initialize session."""

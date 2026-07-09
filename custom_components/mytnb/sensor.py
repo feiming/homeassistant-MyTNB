@@ -8,9 +8,12 @@ import time
 from typing import Any
 import zoneinfo
 
-from homeassistant.components.recorder import DOMAIN as RECORDER_DOMAIN
+from homeassistant.components.recorder import DOMAIN as RECORDER_DOMAIN, get_instance
 from homeassistant.components.recorder.models import StatisticData, StatisticMetaData
-from homeassistant.components.recorder.statistics import async_import_statistics
+from homeassistant.components.recorder.statistics import (
+    async_import_statistics,
+    get_last_statistics,
+)
 from homeassistant.components.sensor import (
     SensorDeviceClass,
     SensorEntity,
@@ -25,9 +28,10 @@ from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.update_coordinator import (
     CoordinatorEntity,
     DataUpdateCoordinator,
+    UpdateFailed,
 )
 
-from .api import MyTNBAPI
+from .api import MyTNBAPI, MyTNBAuthError
 from .const import (
     ATTR_GRANULARITY,
     ATTR_METRIC,
@@ -70,19 +74,21 @@ SENSOR_DESCRIPTIONS: tuple[SensorEntityDescription, ...] = (
         state_class=SensorStateClass.MEASUREMENT,
         icon="mdi:currency-usd",
     ),
+    # History sensors deliberately have no state_class: their data arrives
+    # ~2 days late, and a state_class would make the recorder compile
+    # statistics from the live state at the current time, mixing "now"
+    # rows into the backdated statistics imported in _import_statistics.
     SensorEntityDescription(
         key="usage_history",
         name="Usage History",
         native_unit_of_measurement=UnitOfEnergy.KILO_WATT_HOUR,
         device_class=SensorDeviceClass.ENERGY,
-        state_class=SensorStateClass.TOTAL_INCREASING,
         icon="mdi:lightning-bolt",
     ),
     SensorEntityDescription(
         key="cost_history",
         name="Cost History",
         native_unit_of_measurement="MYR",
-        state_class=SensorStateClass.TOTAL_INCREASING,
         icon="mdi:currency-usd",
     ),
 )
@@ -119,17 +125,26 @@ class MyTNBCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self.entry = entry
 
     async def _async_update_data(self) -> dict[str, Any]:
-        """Fetch data from MyTNB API."""
+        """Fetch data from MyTNB API, re-authenticating if the session expired."""
         start_time = time.time()
 
         try:
+            data = await self._fetch_all()
+        except MyTNBAuthError as err:
+            _LOGGER.info("MyTNB session invalid (%s); logging in again", err)
             if not await self.api.authenticate():
-                raise Exception("Authentication failed")
-        except Exception as err:
-            _LOGGER.error("Error authenticating: %s", err)
-            raise
+                raise UpdateFailed("Re-authentication with MyTNB failed") from err
+            try:
+                data = await self._fetch_all()
+            except MyTNBAuthError as err2:
+                raise UpdateFailed(f"Still unauthorized after re-login: {err2}") from err2
 
-        now = datetime.now()
+        _LOGGER.debug("Data update completed in %.2f seconds", time.time() - start_time)
+        return data
+
+    async def _fetch_all(self) -> dict[str, Any]:
+        """Fetch usage and cost data using the current session."""
+        now = datetime.now(_MYT)
         start_date = now - timedelta(days=30)
         end_date = now + timedelta(days=1)
         start_str = start_date.strftime("%Y-%m-%d+00:00")
@@ -152,17 +167,16 @@ class MyTNBCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 data[metric] = result
                 points = self._extract_points(result)
                 _LOGGER.debug("%s: %d data points fetched", metric, len(points))
+            except MyTNBAuthError:
+                raise
             except Exception as err:
                 _LOGGER.error("Error fetching %s data: %s", metric, err)
                 data[metric] = None
 
-        try:
-            data["sdpudcid"] = await self.api.get_sdpudcid()
-        except Exception as err:
-            _LOGGER.error("Error fetching sdpudcid: %s", err)
-            data["sdpudcid"] = None
+        if data["usage"] is None and data["cost"] is None:
+            raise UpdateFailed("Failed to fetch both usage and cost data")
 
-        _LOGGER.debug("Data update completed in %.2f seconds", time.time() - start_time)
+        data["sdpudcid"] = await self.api.get_sdpudcid()
         return data
 
     def _extract_points(self, metric_data: Any) -> list[tuple[datetime, float]]:
@@ -222,13 +236,19 @@ class MyTNBSensor(CoordinatorEntity[MyTNBCoordinator], SensorEntity):
         metric, agg = self.entity_description.key.rsplit("_", 1)
         return metric, agg
 
+    async def async_added_to_hass(self) -> None:
+        """Import statistics for the data fetched before the entity existed."""
+        await super().async_added_to_hass()
+        if self.entity_description.key in ("usage_history", "cost_history"):
+            await self._async_import_statistics()
+
     @callback
     def _handle_coordinator_update(self) -> None:
         super()._handle_coordinator_update()
         if self.entity_description.key in ("usage_history", "cost_history") and self.entity_id:
-            self._import_statistics()
+            self.hass.async_create_task(self._async_import_statistics())
 
-    def _import_statistics(self) -> None:
+    async def _async_import_statistics(self) -> None:
         if not self.coordinator.data:
             return
         metric, _ = self._metric_and_agg()
@@ -236,11 +256,34 @@ class MyTNBSensor(CoordinatorEntity[MyTNBCoordinator], SensorEntity):
         if not points:
             return
 
-        cumulative = 0.0
-        stats: list[StatisticData] = []
+        # Long-term statistics require hour-aligned timestamps; bucket in case
+        # any points aren't already hour-aligned.
+        hourly: dict[datetime, float] = {}
         for dt, val in points:
+            hour = dt.replace(minute=0, second=0, microsecond=0)
+            hourly[hour] = hourly.get(hour, 0.0) + val
+
+        # Continue from the last imported statistic so the running sum stays
+        # monotonic even though each fetch only covers a sliding 30-day window.
+        last_stats = await get_instance(self.hass).async_add_executor_job(
+            get_last_statistics, self.hass, 1, self.entity_id, True, {"sum"}
+        )
+        cumulative = 0.0
+        last_start: datetime | None = None
+        if rows := last_stats.get(self.entity_id):
+            cumulative = rows[0]["sum"] or 0.0
+            last_start = datetime.fromtimestamp(rows[0]["start"], tz=_MYT)
+
+        stats: list[StatisticData] = []
+        for hour in sorted(hourly):
+            if last_start is not None and hour <= last_start:
+                continue
+            val = hourly[hour]
             cumulative += val
-            stats.append(StatisticData(start=dt, state=val, sum=cumulative))
+            stats.append(StatisticData(start=hour, state=val, sum=cumulative))
+
+        if not stats:
+            return
 
         metadata = StatisticMetaData(
             has_mean=False,
