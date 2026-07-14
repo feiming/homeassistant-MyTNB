@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import re
 import logging
 from datetime import datetime, timedelta
@@ -9,6 +10,12 @@ from typing import Any
 from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
 
 import aiohttp
+
+# The smartliving backend propagates a fresh session with some lag, so a
+# request made too soon can get a login redirect even though the session
+# is valid. Retry such responses a few times before giving up.
+_SESSION_LAG_RETRIES = 3
+_SESSION_LAG_DELAY = 2.0
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -168,37 +175,49 @@ class MyTNBAPI:
         
         _LOGGER.debug("Fetching sdpudcid from dashboard: %s", url)
 
-        try:
-            async with session.get(url, headers=headers) as response:
-                if response.status in (401, 403):
-                    raise MyTNBAuthError(
-                        f"Dashboard request rejected with status {response.status}"
-                    )
-                response.raise_for_status()
-                status = response.status
-                text = await response.text()
-        except aiohttp.TooManyRedirects as err:
-            # An expired smartliving session bounces the dashboard between
-            # login redirects until aiohttp gives up; treat it as an auth
-            # failure so the coordinator re-logins instead of erroring out.
-            raise MyTNBAuthError(
-                "Dashboard stuck in login redirect loop (session expired?)"
-            ) from err
+        for attempt in range(_SESSION_LAG_RETRIES):
+            try:
+                async with session.get(url, headers=headers) as response:
+                    if response.status in (401, 403):
+                        raise MyTNBAuthError(
+                            f"Dashboard request rejected with status {response.status}"
+                        )
+                    response.raise_for_status()
+                    status = response.status
+                    text = await response.text()
+            except aiohttp.TooManyRedirects as err:
+                # An expired smartliving session bounces the dashboard between
+                # login redirects until aiohttp gives up; treat it as an auth
+                # failure so the coordinator re-logins instead of erroring out.
+                raise MyTNBAuthError(
+                    "Dashboard stuck in login redirect loop (session expired?)"
+                ) from err
 
-        _LOGGER.debug("Dashboard response: status=%d, response_length=%d", status, len(text))
+            _LOGGER.debug("Dashboard response: status=%d, response_length=%d", status, len(text))
 
-        match = re.search(r'"sdpudcid":"(\d+)"', text)
-        if match:
-            self._sdpudcid = match.group(1)
-            _LOGGER.debug("Extracted sdpudcid: %s", self._sdpudcid)
-            return self._sdpudcid
+            match = re.search(r'"sdpudcid":"(\d+)"', text)
+            if match:
+                self._sdpudcid = match.group(1)
+                _LOGGER.debug("Extracted sdpudcid: %s", self._sdpudcid)
+                return self._sdpudcid
 
-        # A dashboard page without sdpudcid is almost always the login
-        # redirect, i.e. the session is missing or expired.
+            # A fresh session takes a moment to propagate on TNB's side, so
+            # the first dashboard hit after login can land on the login
+            # redirect even though the session is valid; retry before
+            # concluding the session is dead.
+            _LOGGER.debug(
+                "No sdpudcid in dashboard response (attempt %d/%d, status=%s, length=%d)",
+                attempt + 1,
+                _SESSION_LAG_RETRIES,
+                status,
+                len(text) if text else 0,
+            )
+            if attempt < _SESSION_LAG_RETRIES - 1:
+                await asyncio.sleep(_SESSION_LAG_DELAY)
+
         _LOGGER.warning(
-            "Could not find sdpudcid in dashboard response. Status: %s, Response length: %d",
-            status,
-            len(text) if text else 0,
+            "Could not find sdpudcid in dashboard response after %d attempts",
+            _SESSION_LAG_RETRIES,
         )
         raise MyTNBAuthError("Could not find sdpudcid in dashboard response (session expired?)")
 
@@ -245,7 +264,6 @@ class MyTNBAPI:
             end: End date in format 'YYYY-MM-DD+00:00'
         """
         sdpudcid = await self.get_sdpudcid()
-        await self._visit_commodity_page(metric)
         session = await self._get_session()
         url = "https://smartliving.myaccount.mytnb.com.my/my_energy_request/timeseries"
         headers = {
@@ -274,29 +292,47 @@ class MyTNBAPI:
         if end:
             query_params["end"] = end
 
-        async with session.get(url, headers=headers, params=query_params) as response:
-            if response.status in (401, 403):
-                raise MyTNBAuthError(f"Timeseries request rejected with status {response.status}")
-            response.raise_for_status()
+        for attempt in range(_SESSION_LAG_RETRIES):
+            # The timeseries endpoint only answers a request made right after
+            # the matching commodity page was loaded, so arm it every attempt.
+            await self._visit_commodity_page(metric)
 
-            # Debug: log the actual URL and params being sent (with sensitive data redacted)
-            _LOGGER.debug("API request URL: %s", _redact_url(str(response.url)))
-            _LOGGER.debug("Query params: %s", _redact_dict(query_params))
+            async with session.get(url, headers=headers, params=query_params) as response:
+                if response.status in (401, 403):
+                    raise MyTNBAuthError(f"Timeseries request rejected with status {response.status}")
+                response.raise_for_status()
 
-            try:
-                result = await response.json()
-            except aiohttp.ContentTypeError as err:
-                # An expired session gets redirected to the HTML login page
-                # with status 200, so a non-JSON body means we must re-login.
-                raise MyTNBAuthError("Timeseries endpoint returned non-JSON (session expired?)") from err
+                # Debug: log the actual URL and params being sent (with sensitive data redacted)
+                _LOGGER.debug("API request URL: %s", _redact_url(str(response.url)))
+                _LOGGER.debug("Query params: %s", _redact_dict(query_params))
+
+                try:
+                    result = await response.json()
+                except aiohttp.ContentTypeError as err:
+                    # An expired session gets redirected to the HTML login page
+                    # with status 200, so a non-JSON body means we must re-login.
+                    raise MyTNBAuthError("Timeseries endpoint returned non-JSON (session expired?)") from err
 
             # A rejected request comes back as HTTP 200 with a JSON body like
-            # {"data": [], "redirect": true, "redirectTo": "/login"}.
-            if isinstance(result, dict) and result.get("redirect"):
-                raise MyTNBAuthError(
-                    f"Timeseries endpoint redirected to {result.get('redirectTo')} (session expired?)"
-                )
-            return result
+            # {"data": [], "redirect": true, "redirectTo": "/login"}. That
+            # happens transiently while a fresh session propagates on TNB's
+            # side, so retry before treating it as an expired session.
+            if not (isinstance(result, dict) and result.get("redirect")):
+                return result
+
+            _LOGGER.debug(
+                "Timeseries %s redirected to %s (attempt %d/%d)",
+                metric,
+                result.get("redirectTo"),
+                attempt + 1,
+                _SESSION_LAG_RETRIES,
+            )
+            if attempt < _SESSION_LAG_RETRIES - 1:
+                await asyncio.sleep(_SESSION_LAG_DELAY)
+
+        raise MyTNBAuthError(
+            f"Timeseries endpoint kept redirecting to login after {_SESSION_LAG_RETRIES} attempts"
+        )
 
     async def authenticate(self) -> bool:
         """Authenticate and initialize session."""
