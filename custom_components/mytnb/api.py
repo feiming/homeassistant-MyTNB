@@ -202,6 +202,31 @@ class MyTNBAPI:
         )
         raise MyTNBAuthError("Could not find sdpudcid in dashboard response (session expired?)")
 
+    async def _visit_commodity_page(self, metric: str) -> None:
+        """Load the commodity page for a metric to arm the timeseries endpoint.
+
+        The smartliving backend only answers a timeseries request made right
+        after the matching commodity page was loaded; otherwise it replies
+        with a redirect-to-login JSON even when the session is valid.
+        """
+        session = await self._get_session()
+        url = f"https://smartliving.myaccount.mytnb.com.my/commodity/electric/{metric}"
+        headers = {
+            "Host": "smartliving.myaccount.mytnb.com.my",
+            "Accept-Encoding": "gzip, deflate, br, zstd",
+            "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        }
+        async with session.get(url, headers=headers) as response:
+            _LOGGER.debug(
+                "Commodity page %s: status=%d", metric, response.status
+            )
+            if response.status in (401, 403):
+                raise MyTNBAuthError(
+                    f"Commodity page rejected with status {response.status}"
+                )
+            response.raise_for_status()
+
     async def get_data(
         self,
         metric: str,
@@ -220,6 +245,7 @@ class MyTNBAPI:
             end: End date in format 'YYYY-MM-DD+00:00'
         """
         sdpudcid = await self.get_sdpudcid()
+        await self._visit_commodity_page(metric)
         session = await self._get_session()
         url = "https://smartliving.myaccount.mytnb.com.my/my_energy_request/timeseries"
         headers = {
@@ -258,11 +284,19 @@ class MyTNBAPI:
             _LOGGER.debug("Query params: %s", _redact_dict(query_params))
 
             try:
-                return await response.json()
+                result = await response.json()
             except aiohttp.ContentTypeError as err:
                 # An expired session gets redirected to the HTML login page
                 # with status 200, so a non-JSON body means we must re-login.
                 raise MyTNBAuthError("Timeseries endpoint returned non-JSON (session expired?)") from err
+
+            # A rejected request comes back as HTTP 200 with a JSON body like
+            # {"data": [], "redirect": true, "redirectTo": "/login"}.
+            if isinstance(result, dict) and result.get("redirect"):
+                raise MyTNBAuthError(
+                    f"Timeseries endpoint redirected to {result.get('redirectTo')} (session expired?)"
+                )
+            return result
 
     async def authenticate(self) -> bool:
         """Authenticate and initialize session."""
