@@ -167,28 +167,40 @@ class MyTNBAPI:
         }
         
         _LOGGER.debug("Fetching sdpudcid from dashboard: %s", url)
-        
-        async with session.get(url, headers=headers) as response:
-            response.raise_for_status()
-            status = response.status
-            text = await response.text()
-            
-            _LOGGER.debug("Dashboard response: status=%d, response_length=%d", status, len(text))
-            
-            match = re.search(r'"sdpudcid":"(\d+)"', text)
-            if match:
-                self._sdpudcid = match.group(1)
-                _LOGGER.debug("Extracted sdpudcid: %s", self._sdpudcid)
-                return self._sdpudcid
-            
-            # A dashboard page without sdpudcid is almost always the login
-            # redirect, i.e. the session is missing or expired.
-            _LOGGER.warning(
-                "Could not find sdpudcid in dashboard response. Status: %s, Response length: %d",
-                response.status,
-                len(text) if text else 0,
-            )
-            raise MyTNBAuthError("Could not find sdpudcid in dashboard response (session expired?)")
+
+        try:
+            async with session.get(url, headers=headers) as response:
+                if response.status in (401, 403):
+                    raise MyTNBAuthError(
+                        f"Dashboard request rejected with status {response.status}"
+                    )
+                response.raise_for_status()
+                status = response.status
+                text = await response.text()
+        except aiohttp.TooManyRedirects as err:
+            # An expired smartliving session bounces the dashboard between
+            # login redirects until aiohttp gives up; treat it as an auth
+            # failure so the coordinator re-logins instead of erroring out.
+            raise MyTNBAuthError(
+                "Dashboard stuck in login redirect loop (session expired?)"
+            ) from err
+
+        _LOGGER.debug("Dashboard response: status=%d, response_length=%d", status, len(text))
+
+        match = re.search(r'"sdpudcid":"(\d+)"', text)
+        if match:
+            self._sdpudcid = match.group(1)
+            _LOGGER.debug("Extracted sdpudcid: %s", self._sdpudcid)
+            return self._sdpudcid
+
+        # A dashboard page without sdpudcid is almost always the login
+        # redirect, i.e. the session is missing or expired.
+        _LOGGER.warning(
+            "Could not find sdpudcid in dashboard response. Status: %s, Response length: %d",
+            status,
+            len(text) if text else 0,
+        )
+        raise MyTNBAuthError("Could not find sdpudcid in dashboard response (session expired?)")
 
     async def get_data(
         self,

@@ -11,10 +11,11 @@ from homeassistant.helpers.redact import async_redact_data
 
 from .api import MyTNBAPI
 from .const import CONF_SMARTMETER_URL
+from .coordinator import MyTNBCoordinator
 
 PLATFORMS: list[Platform] = [Platform.SENSOR]
 
-type MyTNBConfigEntry = ConfigEntry[MyTNBAPI]
+type MyTNBConfigEntry = ConfigEntry[MyTNBCoordinator]
 
 TO_REDACT = [
     CONF_USERNAME,
@@ -31,8 +32,17 @@ async def async_setup_entry(hass: HomeAssistant, entry: MyTNBConfigEntry) -> boo
         entry.data["smartmeter_url"],
     )
 
-    # Store API instance in runtime_data
-    entry.runtime_data = api
+    # Run the first refresh here so a failure raises ConfigEntryNotReady
+    # before the platforms are forwarded, as Home Assistant requires.
+    coordinator = MyTNBCoordinator(hass, api, entry)
+    try:
+        await coordinator.async_config_entry_first_refresh()
+    except Exception:
+        # Setup is retried with a fresh MyTNBAPI; don't leak this session.
+        await api.close()
+        raise
+
+    entry.runtime_data = coordinator
 
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
 
@@ -42,8 +52,8 @@ async def async_setup_entry(hass: HomeAssistant, entry: MyTNBConfigEntry) -> boo
 async def async_unload_entry(hass: HomeAssistant, entry: MyTNBConfigEntry) -> bool:
     """Unload a config entry."""
     # Close the API session when unloading
-    if api := entry.runtime_data:
-        await api.close()
+    if coordinator := entry.runtime_data:
+        await coordinator.api.close()
     return await hass.config_entries.async_unload_platforms(entry, PLATFORMS)
 
 
@@ -55,8 +65,9 @@ async def async_get_config_entry_diagnostics(
     Note: All sensitive data (passwords, usernames, URLs) is redacted
     using async_redact_data to prevent credential exposure.
     """
-    api = entry.runtime_data
-    
+    coordinator = entry.runtime_data
+    api = coordinator.api if coordinator else None
+
     # Gather diagnostic information
     # Following Home Assistant's recommended pattern from:
     # https://developers.home-assistant.io/docs/core/integration_diagnostics/
