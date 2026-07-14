@@ -28,7 +28,9 @@ class MyTNBCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             hass,
             _LOGGER,
             name=DOMAIN,
-            update_interval=timedelta(minutes=30),
+            # TNB publishes data roughly two days late, and each fetch covers
+            # a sliding 30-day window, so once a day is plenty.
+            update_interval=timedelta(hours=24),
         )
         self.api = api
         self.entry = entry
