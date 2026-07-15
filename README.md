@@ -1,116 +1,76 @@
-# MyTNB Integration for Home Assistant
+# MyTNB for Home Assistant
 
-A Home Assistant custom integration to monitor your Tenaga Nasional Berhad (TNB) smart meter energy usage and costs.
+Custom integration for [Tenaga Nasional Berhad](https://www.mytnb.com.my/) smart meters.
+It logs into the myTNB portal, reads 30-minute usage and daily cost data from the
+smartliving dashboard, and feeds it into Home Assistant.
 
 ## Features
 
-- Monitor energy usage (kWh) from your TNB smart meter
-- Monitor energy costs (MYR) 
-- Automatic updates every 30 minutes
-- Configurable via Home Assistant UI
-- Supports HACS installation
+- **Sensors**: latest usage (kWh), latest cost (MYR), month-to-date usage and cost.
+- **Energy dashboard**: hourly usage and cost are imported as external long-term
+  statistics (`mytnb:usage_<meter>` / `mytnb:cost_<meter>`), correctly backdated —
+  TNB publishes data roughly two days late, and the statistics are recorded at
+  the time the energy was actually used.
+- **Reauthentication flow**: if your password changes, Home Assistant prompts for
+  the new one instead of failing silently.
 
 ## Installation
 
-### HACS (Recommended)
+### HACS
 
-1. Install [HACS](https://hacs.xyz/) if you haven't already
-2. Go to HACS → Integrations
-3. Click the three dots menu (⋮) → Custom repositories
-4. Add this repository URL: `https://github.com/feiming/homeassistant-MyTNB`
-5. Select category: Integration
-6. Click Add
-7. Search for "MyTNB" in HACS and install it
-8. Restart Home Assistant
+1. HACS → Integrations → ⋮ → Custom repositories → add
+   `https://github.com/feiming/homeassistant-MyTNB` as an **Integration**.
+2. Search for "MyTNB" in HACS and install it.
+3. Restart Home Assistant.
 
-### Manual Installation
+### Manual
 
-1. Copy the `mytnb` folder from `custom_components/mytnb` to your Home Assistant `custom_components` directory:
-   ```
-   <config>/custom_components/mytnb/
-   ```
-2. Restart Home Assistant
-3. Add the integration via Settings → Devices & Services → Add Integration
+1. Copy `custom_components/mytnb` into your Home Assistant `custom_components`
+   directory.
+2. Restart Home Assistant.
+
+Then add the **Tenaga Nasional** integration via *Settings → Devices & Services*.
 
 ## Configuration
 
-1. Go to Settings → Devices & Services → Add Integration
-2. Search for "Tenaga Nasional" or "MyTNB"
-3. Enter your MyTNB account credentials:
-   - **Username**: Your MyTNB email address
-   - **Password**: Your MyTNB password
-   - **Smart Meter URL**: The full URL to your smart meter page (found in your MyTNB account dashboard)
+You will need:
 
-## Finding Your Smart Meter URL
+- Your myTNB **email** and **password**.
+- The **smart meter URL**: log into <https://myaccount.mytnb.com.my>, open your
+  smart meter page, and copy the full URL. It contains
+  `/AccountManagement/SmartMeter/Index/TRIL?caNo=...`.
 
-1. Log in to [MyTNB](https://myaccount.mytnb.com.my/)
-2. Navigate to Account Management → Smart Meter
-3. Copy the full URL from your browser's address bar (it should look like: `https://myaccount.mytnb.com.my/AccountManagement/SmartMeter/Index/TRIL?caNo=...`)
-4. Paste it into the Smart Meter URL field during setup
+## Energy dashboard setup
 
-## Sensors
+In *Settings → Dashboards → Energy*, add **Grid consumption** and pick the
+`MyTNB Usage` statistic; use `MyTNB Cost` for "Use an entity tracking the total costs".
 
-The integration creates the following sensors:
+<img src="docs/images/energy-dashboard-grid-config.png" width="500" alt="Configure grid connection dialog with MyTNB Usage selected">
 
-- **`sensor.energy_usage`**: Total energy consumption in kWh (state class: total_increasing)
-- **`sensor.energy_cost`**: Total energy cost in MYR (state class: total_increasing)
+Once configured, hourly usage shows up alongside your other energy sources:
 
-Both sensors:
-- Update every 30 minutes
-- Show data from the last 7 days
-- Include attributes: `sdpudcid`, `metric`, `view`, `granularity`
+<img src="docs/images/energy-dashboard-electricity.png" width="800" alt="Energy dashboard Electricity tab showing MyTNB usage bars">
+<img src="docs/images/energy-dashboard-summary.png" width="800" alt="Energy dashboard Summary tab showing grid and solar totals">
 
-## Troubleshooting
+## How it works (and why it looks odd)
 
-### Authentication Errors
+The TNB portal has no public API, so the integration replays the browser flow:
+login → SSO handler → smart meter page → smartliving dashboard → commodity page
+→ timeseries API. Two quirks are handled internally:
 
-If you encounter authentication errors:
-- Verify your username and password are correct
-- Ensure your Smart Meter URL is the complete URL including all query parameters
-- Check that you can log in to the MyTNB website manually
-- Try logging out and back in to MyTNB website to refresh your session
-
-### Connection Errors
-
-If you see connection errors:
-- Check your internet connection
-- Verify the Smart Meter URL is correct and accessible
-- Check Home Assistant logs for more details
-
-### No Data
-
-If sensors show "unknown" or no data:
-- Wait a few minutes for the first update (up to 30 minutes)
-- Check Home Assistant logs for API errors
-- Verify your smart meter is active and reporting data on the MyTNB website
+- The timeseries endpoint only answers a request made right after the matching
+  commodity page was loaded; otherwise it replies with a redirect-to-login JSON
+  even when the session is valid.
+- Fresh sessions take a few seconds to propagate on TNB's side, so login-redirect
+  responses are retried before the session is considered expired.
 
 ## Development
 
-This integration was converted from a standalone Python script (`get_smartmeter_data.py`) into a Home Assistant custom integration.
-
-### Project Structure
-
 ```
-homeassistant-MyTNB/
-├── custom_components/
-│   └── mytnb/
-│       ├── __init__.py          # Integration setup
-│       ├── manifest.json         # Integration metadata
-│       ├── config_flow.py       # UI configuration flow
-│       ├── sensor.py            # Sensor platform
-│       ├── api.py               # MyTNB API client
-│       ├── const.py             # Constants
-│       ├── strings.json         # UI strings
-│       └── translations/        # Translation files
-├── hacs.json                    # HACS metadata
-├── info.md                      # HACS info page
-└── README.md                    # This file
+pip install -r requirements-test.txt
+pytest
 ```
-
-## Support
-
-For issues and feature requests, please visit the [GitHub repository](https://github.com/feiming/homeassistant-MyTNB).
 
 ## License
 
-See LICENSE file for details.
+[MIT](LICENSE)

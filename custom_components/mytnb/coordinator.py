@@ -1,123 +1,114 @@
-"""Data update coordinator for the MyTNB integration."""
+"""Data update coordinator for the Tenaga Nasional integration."""
 
 from __future__ import annotations
 
-from datetime import datetime, timedelta
 import logging
-import time
-from typing import Any
-import zoneinfo
+from datetime import datetime, timedelta
 
+from homeassistant.components.recorder import get_instance
+from homeassistant.components.recorder.models import StatisticData, StatisticMetaData
+from homeassistant.components.recorder.statistics import (
+    async_add_external_statistics,
+    get_last_statistics,
+)
 from homeassistant.config_entries import ConfigEntry
+from homeassistant.const import UnitOfEnergy
 from homeassistant.core import HomeAssistant
+from homeassistant.exceptions import ConfigEntryAuthFailed
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 
-from .api import MyTNBAPI, MyTNBAuthError
-from .const import DEFAULT_GRANULARITY, DEFAULT_VIEW, DOMAIN
+from .api import (
+    TIMEZONE,
+    EnergyPoint,
+    MyTNBAuthError,
+    MyTNBClient,
+    MyTNBConnectionError,
+    SmartMeterData,
+)
+from .const import CURRENCY_MYR, DOMAIN, FETCH_WINDOW, UPDATE_INTERVAL
 
 _LOGGER = logging.getLogger(__name__)
-_MYT = zoneinfo.ZoneInfo("Asia/Kuala_Lumpur")
 
 
-class MyTNBCoordinator(DataUpdateCoordinator[dict[str, Any]]):
-    """MyTNB data update coordinator."""
+class MyTNBCoordinator(DataUpdateCoordinator[SmartMeterData]):
+    """Fetches smart meter data and maintains long-term statistics."""
 
-    def __init__(self, hass: HomeAssistant, api: MyTNBAPI, entry: ConfigEntry) -> None:
+    config_entry: ConfigEntry
+
+    def __init__(self, hass: HomeAssistant, entry: ConfigEntry, client: MyTNBClient) -> None:
         """Initialize the coordinator."""
         super().__init__(
             hass,
             _LOGGER,
             name=DOMAIN,
-            # TNB publishes data roughly two days late, and each fetch covers
-            # a sliding 30-day window, so once a day is plenty.
-            update_interval=timedelta(hours=24),
+            config_entry=entry,
+            update_interval=UPDATE_INTERVAL,
         )
-        self.api = api
-        self.entry = entry
+        self.client = client
 
-    async def _async_update_data(self) -> dict[str, Any]:
-        """Fetch data from MyTNB API, re-authenticating if the session expired."""
-        start_time = time.time()
-
+    async def _async_update_data(self) -> SmartMeterData:
+        """Fetch data and import it into long-term statistics."""
+        now = datetime.now(TIMEZONE)
         try:
-            data = await self._fetch_all()
+            data = await self.client.async_get_data(now - FETCH_WINDOW, now + timedelta(days=1))
         except MyTNBAuthError as err:
-            _LOGGER.info("MyTNB session invalid (%s); logging in again", err)
-            if not await self.api.authenticate():
-                raise UpdateFailed("Re-authentication with MyTNB failed") from err
-            try:
-                data = await self._fetch_all()
-            except MyTNBAuthError as err2:
-                raise UpdateFailed(f"Still unauthorized after re-login: {err2}") from err2
+            raise ConfigEntryAuthFailed(f"Authentication with MyTNB failed: {err}") from err
+        except MyTNBConnectionError as err:
+            raise UpdateFailed(f"Could not fetch data from MyTNB: {err}") from err
 
-        _LOGGER.debug("Data update completed in %.2f seconds", time.time() - start_time)
+        await self._async_insert_statistics("usage", data.usage, UnitOfEnergy.KILO_WATT_HOUR)
+        await self._async_insert_statistics("cost", data.cost, CURRENCY_MYR)
         return data
 
-    async def _fetch_all(self) -> dict[str, Any]:
-        """Fetch usage and cost data using the current session."""
-        now = datetime.now(_MYT)
-        start_date = now - timedelta(days=30)
-        end_date = now + timedelta(days=1)
-        start_str = start_date.strftime("%Y-%m-%d+00:00")
-        end_str = end_date.strftime("%Y-%m-%d+00:00")
+    async def _async_insert_statistics(
+        self, metric: str, points: list[EnergyPoint], unit: str
+    ) -> None:
+        """Import points as external long-term statistics.
 
-        _LOGGER.debug(
-            "Fetching data %s to %s (view=%s, granularity=%s)",
-            start_str, end_str, DEFAULT_VIEW, DEFAULT_GRANULARITY,
+        TNB publishes data roughly two days late, so the recorder's normal
+        state-based statistics would attribute values to the wrong time.
+        External statistics let us backdate each interval to when the
+        energy was actually used, which also feeds the Energy dashboard.
+        """
+        if not points:
+            return
+
+        statistic_id = f"{DOMAIN}:{metric}_{self.client.sdpudcid}"
+
+        # Statistics are hourly; sum sub-hourly points into their hour.
+        hourly: dict[datetime, float] = {}
+        for point in points:
+            hour = point.start.replace(minute=0, second=0, microsecond=0)
+            hourly[hour] = hourly.get(hour, 0.0) + point.value
+
+        # Continue from the last imported statistic so the running sum stays
+        # monotonic even though each fetch only covers a sliding window.
+        last_stats = await get_instance(self.hass).async_add_executor_job(
+            get_last_statistics, self.hass, 1, statistic_id, True, {"sum"}
         )
+        cumulative = 0.0
+        last_start: datetime | None = None
+        if rows := last_stats.get(statistic_id):
+            cumulative = rows[0]["sum"] or 0.0
+            last_start = datetime.fromtimestamp(rows[0]["start"], tz=TIMEZONE)
 
-        data: dict[str, Any] = {}
-
-        for metric in ["usage", "cost"]:
-            # Cost API does not support MIN30 granularity
-            granularity = DEFAULT_GRANULARITY if metric == "usage" else None
-            try:
-                result = await self.api.get_data(
-                    metric, DEFAULT_VIEW, granularity, start_str, end_str
-                )
-                data[metric] = result
-                points = self._extract_points(result)
-                _LOGGER.debug("%s: %d data points fetched", metric, len(points))
-            except MyTNBAuthError:
-                raise
-            except Exception as err:
-                _LOGGER.error("Error fetching %s data: %s", metric, err)
-                data[metric] = None
-
-        if data["usage"] is None and data["cost"] is None:
-            raise UpdateFailed("Failed to fetch both usage and cost data")
-
-        data["sdpudcid"] = await self.api.get_sdpudcid()
-        return data
-
-    def _extract_points(self, metric_data: Any) -> list[tuple[datetime, float]]:
-        """Extract sorted (datetime, value) pairs from API response, skipping nulls."""
-        points: list[tuple[datetime, float]] = []
-        if not isinstance(metric_data, dict) or "data" not in metric_data:
-            return points
-        inner = metric_data["data"]
-        if not isinstance(inner, dict) or "timeseries" not in inner:
-            return points
-        for item in inner.get("timeseries", []):
-            if not isinstance(item, dict):
+        stats: list[StatisticData] = []
+        for hour in sorted(hourly):
+            if last_start is not None and hour <= last_start:
                 continue
-            for point in item.get("data", []):
-                if not isinstance(point, dict):
-                    continue
-                val = point.get("value")
-                dt_str = point.get("datetime")
-                if val is None or not dt_str:
-                    continue
-                try:
-                    dt = datetime.strptime(dt_str, "%Y-%m-%d %H:%M").replace(tzinfo=_MYT)
-                    points.append((dt, float(val)))
-                except (ValueError, TypeError):
-                    pass
-        points.sort(key=lambda x: x[0])
-        return points
+            cumulative += hourly[hour]
+            stats.append(StatisticData(start=hour, state=hourly[hour], sum=cumulative))
 
-    def _monthly_points(self, metric_data: Any) -> list[tuple[datetime, float]]:
-        """Extract points for the current calendar month only."""
-        now = datetime.now(_MYT)
-        month_start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
-        return [(dt, val) for dt, val in self._extract_points(metric_data) if dt >= month_start]
+        if not stats:
+            return
+
+        metadata = StatisticMetaData(
+            has_mean=False,
+            has_sum=True,
+            name=f"MyTNB {metric.capitalize()}",
+            source=DOMAIN,
+            statistic_id=statistic_id,
+            unit_of_measurement=unit,
+        )
+        async_add_external_statistics(self.hass, metadata, stats)
+        _LOGGER.debug("Imported %d hourly %s statistics", len(stats), metric)

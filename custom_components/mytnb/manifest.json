@@ -1,18 +1,11 @@
 {
   "domain": "mytnb",
   "name": "Tenaga Nasional",
-  "codeowners": [
-    "@feiming"
-  ],
+  "codeowners": ["@feiming"],
   "config_flow": true,
   "dependencies": ["recorder"],
   "documentation": "https://github.com/feiming/homeassistant-MyTNB",
-  "homekit": {},
   "iot_class": "cloud_polling",
-  "requirements": [
-    "aiohttp>=3.8.0"
-  ],
-  "ssdp": [],
-  "version": "0.2.0",
-  "zeroconf": []
+  "requirements": [],
+  "version": "1.0.0"
 }

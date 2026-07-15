@@ -2,25 +2,41 @@
   "config": {
     "step": {
       "user": {
-        "title": "MyTNB Account",
-        "description": "Enter your MyTNB account credentials to access your smart meter data.",
+        "title": "Connect to MyTNB",
         "data": {
-          "username": "[%key:common::config_flow::data::username%]",
-          "password": "[%key:common::config_flow::data::password%]",
-          "smartmeter_url": "Smart Meter URL"
+          "username": "Email",
+          "password": "Password",
+          "smartmeter_url": "Smart meter URL"
         },
         "data_description": {
-          "smartmeter_url": "The full URL to your smart meter page from your MyTNB account dashboard"
+          "smartmeter_url": "The full URL of your smart meter page (contains /AccountManagement/SmartMeter/Index/TRIL?caNo=...)."
+        }
+      },
+      "reauth_confirm": {
+        "title": "Reauthenticate MyTNB",
+        "description": "The password for {username} is no longer valid. Enter the new password.",
+        "data": {
+          "password": "Password"
         }
       }
     },
     "error": {
-      "cannot_connect": "[%key:common::config_flow::error::cannot_connect%]",
-      "invalid_auth": "[%key:common::config_flow::error::invalid_auth%]",
-      "unknown": "[%key:common::config_flow::error::unknown%]"
+      "cannot_connect": "Failed to connect to MyTNB",
+      "invalid_auth": "Invalid email or password",
+      "invalid_url": "The smart meter URL does not contain a SmartMeter/Index/TRIL path",
+      "unknown": "Unexpected error"
     },
     "abort": {
-      "already_configured": "[%key:common::config_flow::abort::already_configured_device%]"
+      "already_configured": "This smart meter is already configured",
+      "reauth_successful": "Reauthentication was successful"
+    }
+  },
+  "entity": {
+    "sensor": {
+      "usage_latest": { "name": "Latest usage" },
+      "cost_latest": { "name": "Latest cost" },
+      "usage_monthly": { "name": "Monthly usage" },
+      "cost_monthly": { "name": "Monthly cost" }
     }
   }
 }
