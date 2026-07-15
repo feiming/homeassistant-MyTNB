@@ -6,6 +6,7 @@
   "dependencies": ["recorder"],
   "documentation": "https://github.com/feiming/homeassistant-MyTNB",
   "iot_class": "cloud_polling",
+  "issue_tracker": "https://github.com/feiming/homeassistant-MyTNB/issues",
   "requirements": [],
   "version": "1.0.0"
 }
