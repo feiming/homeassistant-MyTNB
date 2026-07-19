@@ -8,12 +8,23 @@ from typing import Any
 
 import voluptuous as vol
 
-from homeassistant.config_entries import ConfigFlow, ConfigFlowResult
+from homeassistant.config_entries import (
+    ConfigEntry,
+    ConfigFlow,
+    ConfigFlowResult,
+    OptionsFlow,
+)
 from homeassistant.const import CONF_PASSWORD, CONF_USERNAME
 from homeassistant.helpers.aiohttp_client import async_create_clientsession
+from homeassistant.helpers.selector import NumberSelector, NumberSelectorConfig
 
 from .api import MyTNBAuthError, MyTNBClient, MyTNBConnectionError, MyTNBError
-from .const import CONF_SMARTMETER_URL, DOMAIN
+from .const import (
+    CONF_SMARTMETER_URL,
+    CONF_UPDATE_INTERVAL_HOURS,
+    DEFAULT_UPDATE_INTERVAL_HOURS,
+    DOMAIN,
+)
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -32,6 +43,11 @@ class MyTNBConfigFlow(ConfigFlow, domain=DOMAIN):
     """Handle a config flow for Tenaga Nasional."""
 
     VERSION = 1
+
+    @staticmethod
+    def async_get_options_flow(config_entry: ConfigEntry) -> MyTNBOptionsFlow:
+        """Get the options flow for this handler."""
+        return MyTNBOptionsFlow()
 
     async def _async_validate(self, data: dict[str, Any]) -> tuple[str | None, dict[str, str]]:
         """Try the full login flow; returns (sdpudcid, errors)."""
@@ -103,3 +119,26 @@ class MyTNBConfigFlow(ConfigFlow, domain=DOMAIN):
             description_placeholders={CONF_USERNAME: reauth_entry.data[CONF_USERNAME]},
             errors=errors,
         )
+
+
+class MyTNBOptionsFlow(OptionsFlow):
+    """Handle options for the Tenaga Nasional integration."""
+
+    async def async_step_init(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
+        """Let the user adjust the polling interval."""
+        if user_input is not None:
+            return self.async_create_entry(data=user_input)
+
+        current = self.config_entry.options.get(
+            CONF_UPDATE_INTERVAL_HOURS, DEFAULT_UPDATE_INTERVAL_HOURS
+        )
+        schema = vol.Schema(
+            {
+                vol.Required(CONF_UPDATE_INTERVAL_HOURS, default=current): NumberSelector(
+                    NumberSelectorConfig(min=1, max=24, step=1)
+                )
+            }
+        )
+        return self.async_show_form(step_id="init", data_schema=schema)

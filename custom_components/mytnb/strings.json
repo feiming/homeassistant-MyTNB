@@ -31,6 +31,19 @@
       "reauth_successful": "Reauthentication was successful"
     }
   },
+  "options": {
+    "step": {
+      "init": {
+        "title": "MyTNB options",
+        "data": {
+          "update_interval_hours": "Polling interval (hours)"
+        },
+        "data_description": {
+          "update_interval_hours": "TNB publishes data roughly two days late, so polling more than a few times a day gains nothing."
+        }
+      }
+    }
+  },
   "entity": {
     "sensor": {
       "usage_latest": { "name": "Latest usage" },
