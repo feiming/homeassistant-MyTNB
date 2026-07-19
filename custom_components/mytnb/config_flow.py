@@ -35,6 +35,8 @@ class MyTNBConfigFlow(ConfigFlow, domain=DOMAIN):
 
     async def _async_validate(self, data: dict[str, Any]) -> tuple[str | None, dict[str, str]]:
         """Try the full login flow; returns (sdpudcid, errors)."""
+        # detach() (not close()) releases the session without closing the
+        # shared HA connector it borrows; HA also detaches it at shutdown.
         session = async_create_clientsession(self.hass)
         try:
             client = MyTNBClient(
@@ -44,7 +46,7 @@ class MyTNBConfigFlow(ConfigFlow, domain=DOMAIN):
                 data[CONF_SMARTMETER_URL],
             )
         except MyTNBError:
-            await session.close()
+            session.detach()
             return None, {CONF_SMARTMETER_URL: "invalid_url"}
 
         try:
@@ -57,7 +59,7 @@ class MyTNBConfigFlow(ConfigFlow, domain=DOMAIN):
             _LOGGER.exception("Unexpected exception validating credentials")
             return None, {"base": "unknown"}
         finally:
-            await session.close()
+            session.detach()
         return sdpudcid, {}
 
     async def async_step_user(

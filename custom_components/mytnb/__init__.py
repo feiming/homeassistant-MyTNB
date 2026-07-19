@@ -20,6 +20,8 @@ type MyTNBConfigEntry = ConfigEntry[MyTNBCoordinator]
 async def async_setup_entry(hass: HomeAssistant, entry: MyTNBConfigEntry) -> bool:
     """Set up Tenaga Nasional from a config entry."""
     # A dedicated (non-shared) session so the portal's cookies stay isolated.
+    # HA auto-detaches this session on HA shutdown or when this entry is
+    # unloaded/reloaded, so we must not close it ourselves.
     session = async_create_clientsession(hass)
     try:
         client = MyTNBClient(
@@ -33,15 +35,9 @@ async def async_setup_entry(hass: HomeAssistant, entry: MyTNBConfigEntry) -> boo
         raise ConfigEntryError(str(err)) from err
 
     coordinator = MyTNBCoordinator(hass, entry, client)
-    try:
-        await coordinator.async_config_entry_first_refresh()
-    except Exception:
-        # Setup is retried with a fresh session; don't leak this one.
-        await session.close()
-        raise
+    await coordinator.async_config_entry_first_refresh()
 
     entry.runtime_data = coordinator
-    entry.async_on_unload(session.close)
 
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
     return True
