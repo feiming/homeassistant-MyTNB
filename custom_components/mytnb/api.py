@@ -185,11 +185,17 @@ class MyTNBClient:
             try:
                 async with self._session.get(_DASHBOARD_URL, headers=_HTML_HEADERS) as response:
                     if response.status in (401, 403):
-                        raise MyTNBAuthError(
-                            f"Dashboard request rejected with status {response.status}"
-                        )
-                    response.raise_for_status()
-                    text = await response.text()
+                        # The WAF can reject a request while a fresh session
+                        # is still propagating, same as the redirect loop
+                        # below; retry before treating it as a dead session.
+                        if attempt == _SESSION_LAG_RETRIES - 1:
+                            raise MyTNBAuthError(
+                                f"Dashboard request rejected with status {response.status}"
+                            )
+                        text = ""
+                    else:
+                        response.raise_for_status()
+                        text = await response.text()
             except aiohttp.TooManyRedirects:
                 # A login redirect loop happens both for dead sessions and
                 # transiently while a fresh session propagates; retry.
