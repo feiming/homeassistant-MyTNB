@@ -37,8 +37,8 @@ You will need:
 
 - Your myTNB **email** and **password**.
 - The **smart meter URL**: log into <https://myaccount.mytnb.com.my>, go to your
-  account list, and click **View Energy Usage** on the account with **Account
-  Type: Smart Meter**. Copy the full URL from the resulting page — it contains
+  account list, and look for **View Energy Usage** on the account with **Account
+  Type: Smart Meter**. Copy the full URL — it contains
   `/AccountManagement/SmartMeter/Index/TRIL?caNo=...`.
 
   <img src="docs/images/account-details-smart-meter.png" width="350" alt="myTNB account card with the View Energy Usage link highlighted">
