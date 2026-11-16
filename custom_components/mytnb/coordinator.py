@@ -20,6 +20,7 @@ from homeassistant.const import UnitOfEnergy
 from homeassistant.core import HomeAssistant
 from homeassistant.exceptions import ConfigEntryAuthFailed
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
+from homeassistant.util.unit_conversion import EnergyConverter
 
 from .api import (
     TIMEZONE,
@@ -27,6 +28,7 @@ from .api import (
     MyTNBAuthError,
     MyTNBClient,
     MyTNBConnectionError,
+    MyTNBCredentialsError,
     SmartMeterData,
 )
 from .const import (
@@ -62,8 +64,13 @@ class MyTNBCoordinator(DataUpdateCoordinator[SmartMeterData]):
         now = datetime.now(TIMEZONE)
         try:
             data = await self.client.async_get_data(now - FETCH_WINDOW, now + timedelta(days=1))
-        except MyTNBAuthError as err:
+        except MyTNBCredentialsError as err:
             raise ConfigEntryAuthFailed(f"Authentication with MyTNB failed: {err}") from err
+        except MyTNBAuthError as err:
+            # TNB sometimes keeps redirecting a freshly logged-in session to the
+            # login page (issue #2). The password is fine, so retry on the next
+            # poll instead of stopping updates until the user reauthenticates.
+            raise UpdateFailed(f"MyTNB session rejected, will retry: {err}") from err
         except MyTNBConnectionError as err:
             raise UpdateFailed(f"Could not fetch data from MyTNB: {err}") from err
 
@@ -119,6 +126,9 @@ class MyTNBCoordinator(DataUpdateCoordinator[SmartMeterData]):
             name=f"MyTNB {metric.capitalize()}",
             source=DOMAIN,
             statistic_id=statistic_id,
+            unit_class=EnergyConverter.UNIT_CLASS
+            if unit == UnitOfEnergy.KILO_WATT_HOUR
+            else None,
             unit_of_measurement=unit,
         )
         async_add_external_statistics(self.hass, metadata, stats)

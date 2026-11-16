@@ -73,6 +73,10 @@ class MyTNBAuthError(MyTNBError):
     """Credentials rejected, or the session is missing/expired."""
 
 
+class MyTNBCredentialsError(MyTNBAuthError):
+    """The login form itself rejected the email/password."""
+
+
 class MyTNBConnectionError(MyTNBError):
     """Transient network or server-side failure."""
 
@@ -161,7 +165,9 @@ class MyTNBClient:
                 response.raise_for_status()
                 form_fields = dict(_FORM_FIELD_RE.findall(await response.text()))
             if not form_fields:
-                raise MyTNBAuthError("Login page returned no SSO form fields (bad credentials?)")
+                raise MyTNBCredentialsError(
+                    "Login page returned no SSO form fields (bad credentials?)"
+                )
 
             async with self._session.post(_SSO_URL, data=form_fields) as response:
                 if response.status != 200:
