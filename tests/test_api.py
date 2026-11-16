@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from datetime import datetime
+from zoneinfo import ZoneInfo
 
 import pytest
 
@@ -167,3 +168,27 @@ def test_parse_points_handles_malformed_payloads():
 def test_extract_smartmeter_path():
     path = api.extract_smartmeter_path(SMARTMETER_URL)
     assert path == "/AccountManagement/SmartMeter/Index/TRIL?caNo=TESTCA"
+
+
+@pytest.mark.parametrize(
+    ("now", "expected_end"),
+    [
+        ((2026, 7, 15, 23, 24), None),
+        ((2026, 7, 15, 23, 25), (2026, 7, 16, 0, 35)),
+        ((2026, 7, 16, 0, 15), (2026, 7, 16, 0, 35)),
+        ((2026, 7, 16, 0, 34), (2026, 7, 16, 0, 35)),
+        ((2026, 7, 16, 0, 35), None),
+        ((2026, 7, 16, 12, 0), None),
+    ],
+)
+def test_maintenance_window_end(now, expected_end):
+    """Polls around midnight Malaysia time are deferred to the window's end (issue #2)."""
+    end = api.maintenance_window_end(datetime(*now, tzinfo=api.TIMEZONE))
+    assert end == (expected_end and datetime(*expected_end, tzinfo=api.TIMEZONE))
+
+
+def test_maintenance_window_uses_malaysia_time():
+    """A UTC timestamp is judged by its Malaysia-time clock, not its own."""
+    # 16:15 UTC is 00:15 the next day in Malaysia.
+    end = api.maintenance_window_end(datetime(2026, 7, 15, 16, 15, tzinfo=ZoneInfo("UTC")))
+    assert end == datetime(2026, 7, 16, 0, 35, tzinfo=api.TIMEZONE)
