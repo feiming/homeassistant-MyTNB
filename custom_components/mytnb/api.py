@@ -21,7 +21,7 @@ import asyncio
 import logging
 import re
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, time, timedelta
 from typing import Any
 from zoneinfo import ZoneInfo
 
@@ -64,6 +64,14 @@ _REQUEST_DATE_FORMAT = "%Y-%m-%d+00:00"
 _SESSION_LAG_RETRIES = 3
 _SESSION_LAG_DELAY = 2.0
 
+# TNB takes the portal down for scheduled maintenance from 23:30 to 00:30
+# Malaysia time every night and rejects sessions meanwhile (issue #2), so
+# callers should avoid fetching inside this window. It is padded by five
+# minutes each side so a fetch neither runs into the start nor hits the
+# portal the instant it comes back.
+MAINTENANCE_WINDOW_START = time(23, 25)
+MAINTENANCE_WINDOW_END = time(0, 35)
+
 
 class MyTNBError(Exception):
     """Base error for the MyTNB client."""
@@ -95,6 +103,18 @@ class SmartMeterData:
 
     usage: list[EnergyPoint]
     cost: list[EnergyPoint]
+
+
+def maintenance_window_end(now: datetime) -> datetime | None:
+    """Return when TNB's nightly maintenance window ends, or None if outside it."""
+    local = now.astimezone(TIMEZONE)
+    if local.time() >= MAINTENANCE_WINDOW_START:
+        end_date = local.date() + timedelta(days=1)
+    elif local.time() < MAINTENANCE_WINDOW_END:
+        end_date = local.date()
+    else:
+        return None
+    return datetime.combine(end_date, MAINTENANCE_WINDOW_END, tzinfo=TIMEZONE)
 
 
 def extract_smartmeter_path(smartmeter_url: str) -> str:

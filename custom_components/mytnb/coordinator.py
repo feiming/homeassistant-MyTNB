@@ -30,6 +30,7 @@ from .api import (
     MyTNBConnectionError,
     MyTNBCredentialsError,
     SmartMeterData,
+    maintenance_window_end,
 )
 from .const import (
     CONF_UPDATE_INTERVAL_HOURS,
@@ -58,16 +59,30 @@ class MyTNBCoordinator(DataUpdateCoordinator[SmartMeterData]):
             update_interval=timedelta(hours=hours),
         )
         self.client = client
+        self._poll_interval = timedelta(hours=hours)
 
     async def _async_update_data(self) -> SmartMeterData:
         """Fetch data and import it into long-term statistics."""
         now = datetime.now(TIMEZONE)
+
+        # TNB rejects sessions around midnight each night (issue #2). Skip a
+        # poll that lands in that window and run it once the window is over.
+        # With nothing fetched yet (startup) there is no data to keep showing,
+        # so try anyway and let the normal retry handling deal with a failure.
+        window_end = maintenance_window_end(now)
+        if window_end is not None and self.data is not None:
+            self.update_interval = window_end - now
+            _LOGGER.debug("In TNB's nightly maintenance window; deferring poll to %s", window_end)
+            return self.data
+        self.update_interval = self._poll_interval
+
         try:
             data = await self.client.async_get_data(now - FETCH_WINDOW, now + timedelta(days=1))
         except MyTNBCredentialsError as err:
             raise ConfigEntryAuthFailed(f"Authentication with MyTNB failed: {err}") from err
         except MyTNBAuthError as err:
-            # TNB sometimes keeps redirecting a freshly logged-in session to the
+            # TNB rejects sessions for a while around midnight each night, so
+            # even a freshly logged-in session keeps being redirected to the
             # login page (issue #2). The password is fine, so retry on the next
             # poll instead of stopping updates until the user reauthenticates.
             raise UpdateFailed(f"MyTNB session rejected, will retry: {err}") from err
