@@ -18,7 +18,13 @@ from homeassistant.const import CONF_PASSWORD, CONF_USERNAME
 from homeassistant.helpers.aiohttp_client import async_create_clientsession
 from homeassistant.helpers.selector import NumberSelector, NumberSelectorConfig
 
-from .api import MyTNBAuthError, MyTNBClient, MyTNBConnectionError, MyTNBError
+from .api import (
+    MyTNBAuthError,
+    MyTNBClient,
+    MyTNBConnectionError,
+    MyTNBCredentialsError,
+    MyTNBError,
+)
 from .const import (
     CONF_SMARTMETER_URL,
     CONF_UPDATE_INTERVAL_HOURS,
@@ -67,9 +73,11 @@ class MyTNBConfigFlow(ConfigFlow, domain=DOMAIN):
 
         try:
             sdpudcid = await client.async_authenticate()
-        except MyTNBAuthError:
+        except MyTNBCredentialsError:
             return None, {"base": "invalid_auth"}
-        except MyTNBConnectionError:
+        except (MyTNBAuthError, MyTNBConnectionError):
+            # A session the portal rejected after a successful login is a
+            # TNB-side hiccup, not a wrong password.
             return None, {"base": "cannot_connect"}
         except Exception:
             _LOGGER.exception("Unexpected exception validating credentials")

@@ -37,7 +37,7 @@ async def test_authenticate_success(client, fake_tnb):
 async def test_authenticate_bad_credentials(client, fake_tnb):
     """A login page without SSO form fields means the credentials were rejected."""
     fake_tnb.login_body = "<html>Invalid email or password</html>"
-    with pytest.raises(api.MyTNBAuthError):
+    with pytest.raises(api.MyTNBCredentialsError):
         await client.async_authenticate()
 
 
@@ -49,8 +49,10 @@ async def test_dashboard_session_lag_is_retried(client, fake_tnb):
 
 async def test_dashboard_never_propagates_raises_auth_error(client, fake_tnb):
     fake_tnb.dashboard_bodies = ["<html>nope</html>"]
-    with pytest.raises(api.MyTNBAuthError):
+    with pytest.raises(api.MyTNBAuthError) as exc_info:
         await client.async_authenticate()
+    # The password was accepted; this must not trigger a reauth flow.
+    assert not isinstance(exc_info.value, api.MyTNBCredentialsError)
 
 
 async def test_invalid_smartmeter_url_rejected(session):
@@ -140,6 +142,16 @@ async def test_forbidden_timeseries_is_auth_error(client, fake_tnb):
         # relogin is attempted once, then the auth error surfaces
         await client.async_get_data(START, END)
     assert fake_tnb.login_count == 2
+
+
+async def test_timeseries_redirect_loop_is_not_credentials_error(client, fake_tnb, monkeypatch):
+    """A persistent login redirect on timeseries is a session problem, not a bad password."""
+    monkeypatch.setattr(api, "_SESSION_LAG_RETRIES", 1)
+    fake_tnb.timeseries = {"usage": [LOGIN_REDIRECT_JSON], "cost": [COST_OK]}
+
+    with pytest.raises(api.MyTNBAuthError) as exc_info:
+        await client.async_get_data(START, END)
+    assert not isinstance(exc_info.value, api.MyTNBCredentialsError)
 
 
 def test_parse_points_handles_malformed_payloads():
