@@ -2,12 +2,15 @@
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import date, datetime
 from zoneinfo import ZoneInfo
 
 import pytest
 
 from conftest import (
+    BILL_PDF,
+    BILL_TOKEN,
+    BILLING_NO,
     DASHBOARD_PAGE,
     LOGIN_REDIRECT_JSON,
     SDPUDCID,
@@ -377,3 +380,107 @@ def test_maintenance_window_uses_malaysia_time():
     # 16:15 UTC is 00:15 the next day in Malaysia.
     end = api.maintenance_window_end(datetime(2026, 7, 15, 16, 15, tzinfo=ZoneInfo("UTC")))
     assert end == datetime(2026, 7, 16, 0, 35, tzinfo=api.TIMEZONE)
+
+
+# --------------------------------------------------------------------------- #
+# Bill
+# --------------------------------------------------------------------------- #
+EXPECTED_BILL = api.BillData(
+    nem_balance_kwh=970.0,
+    nem_expiry=date(2026, 12, 31),
+    previous_balance=-262.77,
+    current_nem_charge=2.74,
+    rounding_adjustment=0.01,
+    nem_accumulated_balance=0.0,
+    nem_balance_carried_forward=0.0,
+    meters=(
+        api.MeterReading("TEST000000000001", 18740, 19449, 709, "kWh", "export"),
+        api.MeterReading("TEST000000000001", 15084, 15588, 504, "kWh", "import"),
+        api.MeterReading("TEST000000000001", 354, 370, 16, "kW", None),
+        api.MeterReading("TEST000000000001", 15, 15, 0, "kVARh", None),
+    ),
+)
+
+
+def test_parse_bill_pdf():
+    """A real (redacted) TNB bill: PDF bytes -> pypdf text -> values."""
+    assert api.parse_bill_pdf(BILL_PDF) == EXPECTED_BILL
+
+
+def test_parse_bill_missing_values_are_none():
+    """A bill without NEM or meter sections parses, with those values unset."""
+    bill = api.parse_bill_text(["Jumlah Bil Anda (RM)\n123.45"])
+    assert bill == api.BillData()
+
+
+def test_parse_bill_nem_balance_with_thousands_separator():
+    bill = api.parse_bill_text(["Baki NEM\n1,234kWh\nTarikh Luput"])
+    assert bill.nem_balance_kwh == 1234.0
+
+
+def test_parse_bill_expiry_falls_back_to_summary_box():
+    """Without the 'Luput pada' line the date in the Tarikh Luput box is used."""
+    bill = api.parse_bill_text(["Tarikh Luput\nBaki NEM\n30.06.2027\nBaki Terdahulu RM1.00"])
+    assert bill.nem_expiry == date(2027, 6, 30)
+    assert bill.previous_balance == 1.0
+
+
+def test_parse_bill_pdf_rejects_garbage():
+    with pytest.raises(api.MyTNBError):
+        api.parse_bill_pdf(b"%PDF-1.4 not really a pdf")
+
+
+def test_bill_meter_lookup():
+    assert EXPECTED_BILL.meter("kWh", "import").usage == 504
+    assert EXPECTED_BILL.meter("kWh", "export").current == 19449
+    assert EXPECTED_BILL.meter("kW").usage == 16
+    assert EXPECTED_BILL.meter("kWh", "nonsense") is None
+    assert api.BillData().meter("kWh") is None
+
+
+async def test_get_bill_follows_print_pdf_flow(client, fake_tnb):
+    """Logs in, replays PrintPDF(): '<token>,True' -> billingNo -> PDF."""
+    assert await client.async_get_bill() == EXPECTED_BILL
+
+    assert fake_tnb.login_count == 1
+    assert fake_tnb.selected_account_ids == [f"{BILL_TOKEN},True"]
+    # billingNo goes into the URL exactly as returned, '+' and '/' unencoded.
+    assert fake_tnb.pdf_query_strings == [f"billingNo={BILLING_NO}"]
+
+
+async def test_get_bill_expired_session_relogs_in(client, fake_tnb):
+    """A redirect to /Home/SessionExpired triggers one fresh login."""
+    await client.async_authenticate()
+    fake_tnb.account_dashboard_bodies = ["expired", fake_tnb.account_dashboard_bodies[0]]
+
+    assert await client.async_get_bill() == EXPECTED_BILL
+    assert fake_tnb.login_count == 2
+
+
+async def test_get_bill_session_never_recovers_raises_auth_error(client, fake_tnb):
+    fake_tnb.account_dashboard_bodies = ["expired"]
+    with pytest.raises(api.MyTNBAuthError) as exc_info:
+        await client.async_get_bill()
+    assert not isinstance(exc_info.value, api.MyTNBCredentialsError)
+
+
+async def test_get_bill_without_bill_button_raises(client, fake_tnb):
+    fake_tnb.account_dashboard_bodies = ["<html>No bills yet</html>"]
+    with pytest.raises(api.MyTNBError) as exc_info:
+        await client.async_get_bill()
+    assert not isinstance(exc_info.value, api.MyTNBAuthError)
+    assert fake_tnb.selected_account_ids == []
+
+
+async def test_get_bill_non_pdf_response_raises(client, fake_tnb):
+    """PrintPDF2 answering with an error page is a connection error."""
+    fake_tnb.pdf_body = b"<html>Server Error</html>"
+    with pytest.raises(api.MyTNBConnectionError):
+        await client.async_get_bill()
+
+
+async def test_get_bill_empty_billing_no_raises(client, fake_tnb):
+    fake_tnb.billing_no = ""
+    with pytest.raises(api.MyTNBConnectionError):
+        await client.async_get_bill()
+    assert fake_tnb.pdf_query_strings == []

@@ -1,4 +1,4 @@
-"""Tests for the coordinator's handling of TNB's nightly maintenance window.
+"""Tests for the coordinator: TNB's nightly maintenance window and the bill.
 
 Home Assistant isn't installed for these tests, so the handful of names
 coordinator.py imports from it are replaced with minimal stand-ins. That is
@@ -33,6 +33,7 @@ class _FakeDataUpdateCoordinator:
         self.config_entry = config_entry
         self.update_interval = update_interval
         self.data = None
+        self.async_update_listeners = MagicMock()
 
 
 class _FakeUpdateFailed(Exception):
@@ -107,11 +108,17 @@ def fresh_data(coordinator_module):
 
 
 @pytest.fixture
-def coordinator(coordinator_module, fresh_data):
+def bill(coordinator_module):
+    return coordinator_module.BillData(nem_balance_kwh=970.0)
+
+
+@pytest.fixture
+def coordinator(coordinator_module, fresh_data, bill):
     """A coordinator with the default 6-hour interval and a fake client."""
     client = SimpleNamespace(
         sdpudcid="40000000000020022594",
         async_get_data=AsyncMock(return_value=fresh_data),
+        async_get_bill=AsyncMock(return_value=bill),
     )
     entry = SimpleNamespace(options={})
     coord = coordinator_module.MyTNBCoordinator(MagicMock(), entry, client)
@@ -181,7 +188,11 @@ async def test_first_poll_in_window_still_fetches(coordinator, fresh_data, set_n
 
 async def test_configured_interval_is_respected(coordinator_module, fresh_data, set_now):
     """The interval restored after a deferral is the one set in the options."""
-    client = SimpleNamespace(sdpudcid="1", async_get_data=AsyncMock(return_value=fresh_data))
+    client = SimpleNamespace(
+        sdpudcid="1",
+        async_get_data=AsyncMock(return_value=fresh_data),
+        async_get_bill=AsyncMock(return_value=None),
+    )
     entry = SimpleNamespace(options={coordinator_module.CONF_UPDATE_INTERVAL_HOURS: 12})
     coord = coordinator_module.MyTNBCoordinator(MagicMock(), entry, client)
     coord._async_insert_statistics = AsyncMock()
@@ -215,6 +226,156 @@ async def test_bad_credentials_still_trigger_reauth(coordinator, coordinator_mod
 
     with pytest.raises(_FakeConfigEntryAuthFailed):
         await coordinator._async_update_data()
+
+
+def make_coordinator(coordinator_module, fresh_data, bill, **options):
+    client = SimpleNamespace(
+        sdpudcid="1",
+        async_get_data=AsyncMock(return_value=fresh_data),
+        async_get_bill=AsyncMock(return_value=bill),
+    )
+    coord = coordinator_module.MyTNBCoordinator(
+        MagicMock(), SimpleNamespace(options=options), client
+    )
+    coord._async_insert_statistics = AsyncMock()
+    return coord
+
+
+async def test_first_poll_fetches_bill(coordinator, bill, set_now):
+    set_now(2026, 11, 16, 14, 0)
+
+    data = await coordinator._async_update_data()
+
+    assert data.bill is bill
+    coordinator.client.async_get_bill.assert_awaited_once()
+
+
+async def test_bill_not_refetched_before_next_check(coordinator, coordinator_module, bill, set_now):
+    """Default: daily at 09:00. Polls before then reuse the bill."""
+    set_now(2026, 11, 16, 14, 0)
+    await coordinator._async_update_data()
+    assert coordinator.next_bill_check() == datetime(2026, 11, 17, 9, 0, tzinfo=coordinator_module.TIMEZONE)
+
+    set_now(2026, 11, 16, 20, 0)
+    data = await coordinator._async_update_data()
+    set_now(2026, 11, 17, 8, 59)
+    await coordinator._async_update_data()
+
+    assert data.bill is bill
+    assert coordinator.client.async_get_bill.await_count == 1
+
+    set_now(2026, 11, 17, 9, 0)
+    await coordinator._async_update_data()
+    assert coordinator.client.async_get_bill.await_count == 2
+
+
+async def test_bill_interval_and_time_options(coordinator_module, fresh_data, bill, set_now):
+    coord = make_coordinator(
+        coordinator_module,
+        fresh_data,
+        bill,
+        **{
+            coordinator_module.CONF_BILL_INTERVAL_DAYS: 7.0,  # NumberSelector gives floats
+            coordinator_module.CONF_BILL_TIME: "06:30:00",
+        },
+    )
+    set_now(2026, 11, 16, 14, 0)
+    await coord._async_update_data()
+
+    assert coord.next_bill_check() == datetime(
+        2026, 11, 23, 6, 30, tzinfo=coordinator_module.TIMEZONE
+    )
+    assert not coord.bill_due(datetime(2026, 11, 23, 6, 29, tzinfo=coordinator_module.TIMEZONE))
+    assert coord.bill_due(datetime(2026, 11, 23, 6, 30, tzinfo=coordinator_module.TIMEZONE))
+
+
+async def test_bill_disabled_never_fetches(coordinator_module, fresh_data, bill, set_now):
+    coord = make_coordinator(
+        coordinator_module, fresh_data, bill, **{coordinator_module.CONF_BILL_ENABLED: False}
+    )
+    set_now(2026, 11, 16, 14, 0)
+
+    data = await coord._async_update_data()
+    await coord.async_refresh_bill_if_due()
+
+    assert data.bill is None
+    coord.client.async_get_bill.assert_not_awaited()
+
+
+async def test_bill_failure_keeps_previous_bill_and_retries_next_poll(
+    coordinator, coordinator_module, bill, set_now
+):
+    """A failed fetch must not fail the update, drop the last bill, or wait a day."""
+    set_now(2026, 11, 16, 14, 0)
+    await coordinator._async_update_data()
+
+    set_now(2026, 11, 17, 9, 0)
+    coordinator.client.async_get_data.return_value = coordinator_module.SmartMeterData(
+        usage=[], cost=[]
+    )
+    coordinator.client.async_get_bill.side_effect = coordinator_module.MyTNBConnectionError(
+        "PrintPDF2 did not return a PDF"
+    )
+    data = await coordinator._async_update_data()
+    assert data.bill is bill
+
+    set_now(2026, 11, 17, 15, 0)  # next poll, same day: still due, so retried
+    coordinator.client.async_get_bill.side_effect = None
+    await coordinator._async_update_data()
+    assert coordinator.client.async_get_bill.await_count == 3
+
+
+async def test_bill_failure_on_first_poll_still_succeeds(
+    coordinator, coordinator_module, set_now
+):
+    set_now(2026, 11, 16, 14, 0)
+    coordinator.client.async_get_bill.side_effect = coordinator_module.MyTNBError("no bill")
+
+    data = await coordinator._async_update_data()
+
+    assert data.bill is None
+
+
+async def test_scheduled_check_pushes_new_bill_to_sensors(
+    coordinator, coordinator_module, fresh_data, set_now
+):
+    """The time trigger updates sensors without touching the poll schedule."""
+    set_now(2026, 11, 16, 14, 0)
+    await coordinator._async_update_data()
+    coordinator.data = fresh_data
+    interval = coordinator.update_interval
+
+    new_bill = coordinator_module.BillData(nem_balance_kwh=1000.0)
+    coordinator.client.async_get_bill.return_value = new_bill
+    set_now(2026, 11, 17, 9, 0)
+    await coordinator.async_refresh_bill_if_due()
+
+    assert coordinator.data.bill is new_bill
+    coordinator.async_update_listeners.assert_called_once()
+    assert coordinator.update_interval == interval
+
+
+async def test_scheduled_check_not_due_does_nothing(coordinator, fresh_data, set_now):
+    set_now(2026, 11, 16, 14, 0)
+    await coordinator._async_update_data()
+    coordinator.data = fresh_data
+
+    set_now(2026, 11, 16, 20, 0)
+    await coordinator.async_refresh_bill_if_due()
+
+    assert coordinator.client.async_get_bill.await_count == 1
+    coordinator.async_update_listeners.assert_not_called()
+
+
+async def test_bill_never_fetched_in_maintenance_window(coordinator, fresh_data, set_now):
+    """Even a first poll inside the window (which still fetches usage) skips the bill."""
+    set_now(2026, 11, 16, 23, 45)
+
+    data = await coordinator._async_update_data()
+
+    coordinator.client.async_get_data.assert_awaited_once()
+    coordinator.client.async_get_bill.assert_not_awaited()
+    assert data.bill is None
 
 
 async def test_no_smart_meter_is_a_clear_update_failure(

@@ -2,13 +2,17 @@
 
 from __future__ import annotations
 
+from datetime import datetime
+
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import CONF_PASSWORD, CONF_USERNAME, Platform
 from homeassistant.core import HomeAssistant
 from homeassistant.exceptions import ConfigEntryError
 from homeassistant.helpers.aiohttp_client import async_create_clientsession
+from homeassistant.helpers.event import async_track_time_change
+from homeassistant.util import dt as dt_util
 
-from .api import MyTNBClient, MyTNBError
+from .api import TIMEZONE, MyTNBClient, MyTNBError
 from .const import CONF_SMARTMETER_URL
 from .coordinator import MyTNBCoordinator
 
@@ -39,6 +43,22 @@ async def async_setup_entry(hass: HomeAssistant, entry: MyTNBConfigEntry) -> boo
 
     entry.runtime_data = coordinator
     entry.async_on_unload(entry.add_update_listener(_async_update_listener))
+
+    if coordinator.bill_enabled:
+        # Check for a new bill at the configured Malaysia time each day; the
+        # coordinator decides whether the configured number of days has passed.
+        # (Regular polls also catch up on a check missed while HA was down.)
+        local = datetime.combine(datetime.now(TIMEZONE).date(), coordinator.bill_time, TIMEZONE)
+        fire_at = local.astimezone(dt_util.get_default_time_zone())
+        entry.async_on_unload(
+            async_track_time_change(
+                hass,
+                coordinator.async_refresh_bill_if_due,
+                hour=fire_at.hour,
+                minute=fire_at.minute,
+                second=0,
+            )
+        )
 
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
     return True

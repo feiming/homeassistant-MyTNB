@@ -37,10 +37,16 @@
       "init": {
         "title": "MyTNB options",
         "data": {
-          "update_interval_hours": "Polling interval (hours)"
+          "update_interval_hours": "Polling interval (hours)",
+          "bill_enabled": "Fetch latest bill",
+          "bill_interval_days": "Check for a new bill every (days)",
+          "bill_time": "Bill check time"
         },
         "data_description": {
-          "update_interval_hours": "TNB publishes data roughly two days late, so polling more than a few times a day gains nothing."
+          "update_interval_hours": "TNB publishes data roughly two days late, so polling more than a few times a day gains nothing.",
+          "bill_enabled": "Download the latest bill PDF to read the NEM balance, account summary and meter readings. Nothing is stored; turning this off removes the bill sensors.",
+          "bill_interval_days": "Bills are issued monthly, so checking daily picks up a new one within a day.",
+          "bill_time": "Time of day (Malaysia time) to check. Checks are skipped during TNB's nightly maintenance (23:25 to 00:35) and retried afterwards."
         }
       }
     }
@@ -50,7 +56,19 @@
       "usage_latest": { "name": "Latest usage" },
       "cost_latest": { "name": "Latest cost" },
       "usage_monthly": { "name": "Monthly usage" },
-      "cost_monthly": { "name": "Monthly cost" }
+      "cost_monthly": { "name": "Monthly cost" },
+      "nem_balance": { "name": "NEM balance" },
+      "nem_expiry": { "name": "NEM balance expiry" },
+      "previous_balance": { "name": "Previous balance" },
+      "current_nem_charge": { "name": "Current NEM charge" },
+      "rounding_adjustment": { "name": "Rounding adjustment" },
+      "nem_accumulated_balance": { "name": "Accumulated NEM balance" },
+      "nem_balance_carried_forward": { "name": "NEM balance carried forward" },
+      "meter_import_reading": { "name": "Meter import reading" },
+      "meter_export_reading": { "name": "Meter export reading" },
+      "billed_import": { "name": "Billed import" },
+      "billed_export": { "name": "Billed export" },
+      "maximum_demand": { "name": "Maximum demand" }
     }
   }
 }

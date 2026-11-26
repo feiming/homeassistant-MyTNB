@@ -42,6 +42,20 @@ LOGIN_REDIRECT_JSON = {
 }
 
 
+BILL_TOKEN = "5400650073007400"  # "Test" as UTF-16LE hex, like the real button
+ACCOUNT_DASHBOARD_PAGE = (
+    '<button type="button" class="btn btn-outline-success btn-block btn-sm" '
+    f"onclick=\"PrintPDF('{BILL_TOKEN}')\">View Bill</button>"
+)
+# Real billingNo values are base64 and contain '+' and '/'.
+BILLING_NO = "AbCdEf+gH/iJkL=="
+
+
+# A real TNB bill with the personal details (name, addresses, account,
+# invoice, meter and certificate numbers, barcode and QR codes) redacted.
+BILL_PDF = (Path(__file__).parent / "fixtures" / "bill.pdf").read_bytes()
+
+
 class FakeTNB:
     """A configurable fake of the TNB portal.
 
@@ -57,6 +71,12 @@ class FakeTNB:
         self.timeseries: dict[str, list[dict | int]] = {}
         self.login_count = 0
         self.commodity_visits: list[str] = []
+        # myaccount bill flow; "expired" redirects to /Home/SessionExpired
+        self.account_dashboard_bodies: list[str] = [ACCOUNT_DASHBOARD_PAGE]
+        self.billing_no = BILLING_NO
+        self.pdf_body: bytes = BILL_PDF
+        self.selected_account_ids: list[str] = []
+        self.pdf_query_strings: list[str] = []
 
         self.app = web.Application()
         self.app.router.add_post("/api/sitecore/Account/Login", self._login)
@@ -65,6 +85,16 @@ class FakeTNB:
         self.app.router.add_get("/dashboard", self._dashboard)
         self.app.router.add_get("/commodity/electric/{metric}", self._commodity)
         self.app.router.add_get("/my_energy_request/timeseries", self._timeseries)
+        self.app.router.add_get(
+            "/AccountManagement/IndividualDashboard", self._account_dashboard
+        )
+        self.app.router.add_get("/Home/SessionExpired", self._session_expired)
+        self.app.router.add_post(
+            "/AccountManagement/ViewAccountProfile/InitProtectID", self._init_protect
+        )
+        self.app.router.add_get(
+            "/AccountManagement/ViewAccountProfile/PrintPDF2", self._print_pdf
+        )
 
     @staticmethod
     def _pop(queue: list) -> object:
@@ -95,6 +125,25 @@ class FakeTNB:
         if isinstance(entry, int):
             return web.Response(status=entry)
         return web.json_response(entry)
+
+
+    async def _account_dashboard(self, request: web.Request) -> web.Response:
+        body = self._pop(self.account_dashboard_bodies)
+        if body == "expired":
+            raise web.HTTPFound("/Home/SessionExpired")
+        return web.Response(text=body, content_type="text/html")
+
+    async def _session_expired(self, request: web.Request) -> web.Response:
+        return web.Response(text="<html>Session expired</html>", content_type="text/html")
+
+    async def _init_protect(self, request: web.Request) -> web.Response:
+        form = await request.post()
+        self.selected_account_ids.append(form["selectedAccountID"])
+        return web.Response(text=self.billing_no)
+
+    async def _print_pdf(self, request: web.Request) -> web.Response:
+        self.pdf_query_strings.append(request.raw_path.partition("?")[2])
+        return web.Response(body=self.pdf_body, content_type="application/pdf")
 
 
 @pytest.fixture(autouse=True)

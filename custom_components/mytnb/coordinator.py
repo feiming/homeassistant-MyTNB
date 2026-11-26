@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import logging
-from datetime import datetime, timedelta
+from datetime import datetime, time, timedelta
 
 from homeassistant.components.recorder import get_instance
 from homeassistant.components.recorder.models import (
@@ -24,18 +24,26 @@ from homeassistant.util.unit_conversion import EnergyConverter
 
 from .api import (
     TIMEZONE,
+    BillData,
     EnergyPoint,
     MyTNBAuthError,
     MyTNBClient,
     MyTNBConnectionError,
     MyTNBCredentialsError,
+    MyTNBError,
     MyTNBNoSmartMeterError,
     SmartMeterData,
     maintenance_window_end,
 )
 from .const import (
+    CONF_BILL_ENABLED,
+    CONF_BILL_INTERVAL_DAYS,
+    CONF_BILL_TIME,
     CONF_UPDATE_INTERVAL_HOURS,
     CURRENCY_MYR,
+    DEFAULT_BILL_ENABLED,
+    DEFAULT_BILL_INTERVAL_DAYS,
+    DEFAULT_BILL_TIME,
     DEFAULT_UPDATE_INTERVAL_HOURS,
     DOMAIN,
     FETCH_WINDOW,
@@ -61,6 +69,15 @@ class MyTNBCoordinator(DataUpdateCoordinator[SmartMeterData]):
         )
         self.client = client
         self._poll_interval = timedelta(hours=hours)
+
+        options = entry.options
+        self.bill_enabled: bool = options.get(CONF_BILL_ENABLED, DEFAULT_BILL_ENABLED)
+        self.bill_interval = timedelta(
+            days=int(options.get(CONF_BILL_INTERVAL_DAYS, DEFAULT_BILL_INTERVAL_DAYS))
+        )
+        self.bill_time: time = time.fromisoformat(options.get(CONF_BILL_TIME, DEFAULT_BILL_TIME))
+        self.bill: BillData | None = None
+        self.bill_fetched_at: datetime | None = None
 
     async def _async_update_data(self) -> SmartMeterData:
         """Fetch data and import it into long-term statistics."""
@@ -94,7 +111,56 @@ class MyTNBCoordinator(DataUpdateCoordinator[SmartMeterData]):
 
         await self._async_insert_statistics("usage", data.usage, UnitOfEnergy.KILO_WATT_HOUR)
         await self._async_insert_statistics("cost", data.cost, CURRENCY_MYR)
+        if self.bill_due(now):
+            await self._async_fetch_bill(now)
+        data.bill = self.bill
         return data
+
+    def next_bill_check(self) -> datetime | None:
+        """When the bill is next due: the configured time, every N days.
+
+        None means as soon as possible (nothing fetched yet since startup).
+        """
+        if self.bill_fetched_at is None:
+            return None
+        day = self.bill_fetched_at.astimezone(TIMEZONE).date() + self.bill_interval
+        return datetime.combine(day, self.bill_time, tzinfo=TIMEZONE)
+
+    def bill_due(self, now: datetime) -> bool:
+        """Whether a bill fetch should run now."""
+        if not self.bill_enabled or maintenance_window_end(now) is not None:
+            return False
+        next_check = self.next_bill_check()
+        return next_check is None or now >= next_check
+
+    async def async_refresh_bill_if_due(self, _fired_at: datetime | None = None) -> None:
+        """Scheduled check at the configured time; pushes a new bill to sensors.
+
+        Runs between smart meter polls, so it must not reset their timer:
+        listeners are notified directly instead of via async_set_updated_data.
+        """
+        now = datetime.now(TIMEZONE)
+        if self.data is None or not self.bill_due(now):
+            return
+        if await self._async_fetch_bill(now):
+            self.data.bill = self.bill
+            self.async_update_listeners()
+
+    async def _async_fetch_bill(self, now: datetime) -> bool:
+        """Fetch the latest bill; on failure keep the previous one.
+
+        The bill only changes monthly, so a failed fetch must not fail the
+        whole update and take the smart meter sensors down with it. The
+        fetch time is only advanced on success, so the next poll retries.
+        """
+        try:
+            self.bill = await self.client.async_get_bill()
+        except MyTNBError as err:
+            _LOGGER.warning("Could not fetch the latest bill, keeping the previous one: %s", err)
+            return False
+        self.bill_fetched_at = now
+        _LOGGER.debug("Fetched latest bill; next check %s", self.next_bill_check())
+        return True
 
     async def _async_insert_statistics(
         self, metric: str, points: list[EnergyPoint], unit: str
