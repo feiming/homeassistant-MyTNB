@@ -24,6 +24,7 @@
       "cannot_connect": "Failed to connect to MyTNB",
       "invalid_auth": "Invalid email or password",
       "invalid_url": "The smart meter URL does not contain a SmartMeter/Index/TRIL path",
+      "no_smart_meter": "Logged in, but MyTNB lists no smart meter for this account. This integration only works with TNB smart meters.",
       "unknown": "Unexpected error"
     },
     "abort": {

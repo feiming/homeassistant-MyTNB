@@ -58,6 +58,11 @@ _HTML_HEADERS = {
 _SMARTMETER_PATH_RE = re.compile(r"/AccountManagement/SmartMeter/Index/TRIL\?caNo=[^\"\s]+")
 _FORM_FIELD_RE = re.compile(r'name="([^"]+)" value="([^"]*)"')
 _SDPUDCID_RE = re.compile(r'"sdpudcid":"(\d+)"')
+# Account-level JSON embedded in the dashboard of any logged-in account,
+# with or without a smart meter. Login/redirect pages served while a session
+# is still propagating don't carry it, so a dashboard that has this but no
+# sdpudcid means the account has no smart meter.
+_ACCOUNT_MARKER_RE = re.compile(r'"billcyclesurn":"/billcycle\?[^"]*accountnumber=')
 _POINT_DATETIME_FORMAT = "%Y-%m-%d %H:%M"
 _REQUEST_DATE_FORMAT = "%Y-%m-%d+00:00"
 
@@ -83,6 +88,10 @@ class MyTNBAuthError(MyTNBError):
 
 class MyTNBCredentialsError(MyTNBAuthError):
     """The login form itself rejected the email/password."""
+
+
+class MyTNBNoSmartMeterError(MyTNBError):
+    """Logged in fine, but the account has no smart meter (no sdpudcid)."""
 
 
 class MyTNBConnectionError(MyTNBError):
@@ -207,6 +216,7 @@ class MyTNBClient:
 
     async def _fetch_sdpudcid(self) -> str:
         """Load the smartliving dashboard and extract the meter id."""
+        account_page = False
         for attempt in range(_SESSION_LAG_RETRIES):
             try:
                 async with self._session.get(_DASHBOARD_URL, headers=_HTML_HEADERS) as response:
@@ -222,25 +232,35 @@ class MyTNBClient:
                     else:
                         response.raise_for_status()
                         text = await response.text()
+                    final_url = response.url
             except aiohttp.TooManyRedirects:
                 # A login redirect loop happens both for dead sessions and
                 # transiently while a fresh session propagates; retry.
                 text = ""
+                final_url = None
             except aiohttp.ClientError as err:
                 raise MyTNBConnectionError(f"Dashboard request failed: {err}") from err
 
             if match := _SDPUDCID_RE.search(text):
                 return match.group(1)
 
+            account_page = bool(_ACCOUNT_MARKER_RE.search(text))
             _LOGGER.debug(
-                "No sdpudcid in dashboard response (attempt %d/%d, length=%d)",
+                "No sdpudcid in dashboard response (attempt %d/%d, url=%s, "
+                "length=%d, account_page=%s)",
                 attempt + 1,
                 _SESSION_LAG_RETRIES,
+                final_url,
                 len(text),
+                account_page,
             )
             if attempt < _SESSION_LAG_RETRIES - 1:
                 await asyncio.sleep(_SESSION_LAG_DELAY)
 
+        if account_page:
+            raise MyTNBNoSmartMeterError(
+                "Logged in, but the MyTNB dashboard lists no smart meter for this account"
+            )
         raise MyTNBAuthError(
             f"No sdpudcid in dashboard response after {_SESSION_LAG_RETRIES} attempts"
         )

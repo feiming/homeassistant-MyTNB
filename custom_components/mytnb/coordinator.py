@@ -29,6 +29,7 @@ from .api import (
     MyTNBClient,
     MyTNBConnectionError,
     MyTNBCredentialsError,
+    MyTNBNoSmartMeterError,
     SmartMeterData,
     maintenance_window_end,
 )
@@ -86,6 +87,8 @@ class MyTNBCoordinator(DataUpdateCoordinator[SmartMeterData]):
             # login page (issue #2). The password is fine, so retry on the next
             # poll instead of stopping updates until the user reauthenticates.
             raise UpdateFailed(f"MyTNB session rejected, will retry: {err}") from err
+        except MyTNBNoSmartMeterError as err:
+            raise UpdateFailed(f"No smart meter found on this MyTNB account: {err}") from err
         except MyTNBConnectionError as err:
             raise UpdateFailed(f"Could not fetch data from MyTNB: {err}") from err
 

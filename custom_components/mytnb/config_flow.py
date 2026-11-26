@@ -24,6 +24,7 @@ from .api import (
     MyTNBConnectionError,
     MyTNBCredentialsError,
     MyTNBError,
+    MyTNBNoSmartMeterError,
 )
 from .const import (
     CONF_SMARTMETER_URL,
@@ -75,6 +76,8 @@ class MyTNBConfigFlow(ConfigFlow, domain=DOMAIN):
             sdpudcid = await client.async_authenticate()
         except MyTNBCredentialsError:
             return None, {"base": "invalid_auth"}
+        except MyTNBNoSmartMeterError:
+            return None, {"base": "no_smart_meter"}
         except (MyTNBAuthError, MyTNBConnectionError):
             # A session the portal rejected after a successful login is a
             # TNB-side hiccup, not a wrong password.
