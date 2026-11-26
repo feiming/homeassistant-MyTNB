@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
+import calendar
 import logging
-from datetime import datetime, time, timedelta
+from datetime import date, datetime, time, timedelta
 
 from homeassistant.components.recorder import get_instance
 from homeassistant.components.recorder.models import (
@@ -37,16 +38,17 @@ from .api import (
 )
 from .const import (
     CONF_BILL_ENABLED,
-    CONF_BILL_INTERVAL_DAYS,
+    CONF_BILL_DAY,
     CONF_BILL_TIME,
     CONF_UPDATE_INTERVAL_HOURS,
     CURRENCY_MYR,
     DEFAULT_BILL_ENABLED,
-    DEFAULT_BILL_INTERVAL_DAYS,
+    DEFAULT_BILL_DAY,
     DEFAULT_BILL_TIME,
     DEFAULT_UPDATE_INTERVAL_HOURS,
     DOMAIN,
     FETCH_WINDOW,
+    NEW_BILL_GRACE,
 )
 
 _LOGGER = logging.getLogger(__name__)
@@ -72,9 +74,8 @@ class MyTNBCoordinator(DataUpdateCoordinator[SmartMeterData]):
 
         options = entry.options
         self.bill_enabled: bool = options.get(CONF_BILL_ENABLED, DEFAULT_BILL_ENABLED)
-        self.bill_interval = timedelta(
-            days=int(options.get(CONF_BILL_INTERVAL_DAYS, DEFAULT_BILL_INTERVAL_DAYS))
-        )
+        # NumberSelector gives floats.
+        self.bill_day = int(options.get(CONF_BILL_DAY, DEFAULT_BILL_DAY))
         self.bill_time: time = time.fromisoformat(options.get(CONF_BILL_TIME, DEFAULT_BILL_TIME))
         self.bill: BillData | None = None
         self.bill_fetched_at: datetime | None = None
@@ -116,21 +117,57 @@ class MyTNBCoordinator(DataUpdateCoordinator[SmartMeterData]):
         data.bill = self.bill
         return data
 
-    def next_bill_check(self) -> datetime | None:
-        """When the bill is next due: the configured time, every N days.
+    def next_bill_check(self, now: datetime) -> datetime | None:
+        """When the bill should next be fetched. None means as soon as possible.
 
-        None means as soon as possible (nothing fetched yet since startup).
+        From the configured day of the month, the bill is checked daily at the
+        configured time until this month's bill is in; after that, nothing
+        until next month's day. See _have_current_bill.
         """
         if self.bill_fetched_at is None:
             return None
-        day = self.bill_fetched_at.astimezone(TIMEZONE).date() + self.bill_interval
-        return datetime.combine(day, self.bill_time, tzinfo=TIMEZONE)
+        cycle_start = self._last_bill_day(now)
+        if self._have_current_bill(cycle_start):
+            year, month = divmod(cycle_start.year * 12 + cycle_start.month, 12)  # next month
+            return self._bill_check_in(year, month + 1)
+        fetched = self.bill_fetched_at.astimezone(TIMEZONE)
+        daily = datetime.combine(fetched.date(), self.bill_time, tzinfo=TIMEZONE)
+        if daily <= fetched:
+            daily += timedelta(days=1)
+        return max(daily, cycle_start)
+
+    def _have_current_bill(self, cycle_start: datetime) -> bool:
+        """Whether the bill held is this month's.
+
+        A bill dated up to NEW_BILL_GRACE before the configured day counts, so
+        picking a day just after the bill usually arrives doesn't refetch it,
+        while last month's bill (about 30 days older) doesn't. Without a bill
+        date, any bill fetched since the day counts.
+        """
+        assert self.bill_fetched_at is not None
+        if self.bill is not None and self.bill.bill_date is not None:
+            return self.bill.bill_date >= cycle_start.date() - NEW_BILL_GRACE
+        return self.bill_fetched_at >= cycle_start
+
+    def _last_bill_day(self, now: datetime) -> datetime:
+        """The most recent configured day and time at or before now."""
+        now = now.astimezone(TIMEZONE)
+        check = self._bill_check_in(now.year, now.month)
+        if check > now:
+            year, month = divmod(now.year * 12 + now.month - 2, 12)  # previous month
+            check = self._bill_check_in(year, month + 1)
+        return check
+
+    def _bill_check_in(self, year: int, month: int) -> datetime:
+        """The configured day and time in the given month (clamped to its last day)."""
+        day = min(self.bill_day, calendar.monthrange(year, month)[1])
+        return datetime.combine(date(year, month, day), self.bill_time, tzinfo=TIMEZONE)
 
     def bill_due(self, now: datetime) -> bool:
         """Whether a bill fetch should run now."""
         if not self.bill_enabled or maintenance_window_end(now) is not None:
             return False
-        next_check = self.next_bill_check()
+        next_check = self.next_bill_check(now)
         return next_check is None or now >= next_check
 
     async def async_refresh_bill_if_due(self, _fired_at: datetime | None = None) -> None:
@@ -159,7 +196,11 @@ class MyTNBCoordinator(DataUpdateCoordinator[SmartMeterData]):
             _LOGGER.warning("Could not fetch the latest bill, keeping the previous one: %s", err)
             return False
         self.bill_fetched_at = now
-        _LOGGER.debug("Fetched latest bill; next check %s", self.next_bill_check())
+        _LOGGER.debug(
+            "Fetched bill dated %s; next check %s",
+            getattr(self.bill, "bill_date", None),
+            self.next_bill_check(now),
+        )
         return True
 
     async def _async_insert_statistics(

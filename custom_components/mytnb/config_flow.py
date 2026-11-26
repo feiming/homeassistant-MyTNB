@@ -20,6 +20,7 @@ from homeassistant.helpers.selector import (
     BooleanSelector,
     NumberSelector,
     NumberSelectorConfig,
+    NumberSelectorMode,
     TimeSelector,
 )
 
@@ -33,12 +34,12 @@ from .api import (
 )
 from .const import (
     CONF_BILL_ENABLED,
-    CONF_BILL_INTERVAL_DAYS,
+    CONF_BILL_DAY,
     CONF_BILL_TIME,
     CONF_SMARTMETER_URL,
     CONF_UPDATE_INTERVAL_HOURS,
     DEFAULT_BILL_ENABLED,
-    DEFAULT_BILL_INTERVAL_DAYS,
+    DEFAULT_BILL_DAY,
     DEFAULT_BILL_TIME,
     DEFAULT_UPDATE_INTERVAL_HOURS,
     DOMAIN,
@@ -165,9 +166,11 @@ class MyTNBOptionsFlow(OptionsFlow):
                     default=options.get(CONF_BILL_ENABLED, DEFAULT_BILL_ENABLED),
                 ): BooleanSelector(),
                 vol.Required(
-                    CONF_BILL_INTERVAL_DAYS,
-                    default=options.get(CONF_BILL_INTERVAL_DAYS, DEFAULT_BILL_INTERVAL_DAYS),
-                ): NumberSelector(NumberSelectorConfig(min=1, max=31, step=1)),
+                    CONF_BILL_DAY,
+                    default=options.get(CONF_BILL_DAY, DEFAULT_BILL_DAY),
+                ): NumberSelector(
+                    NumberSelectorConfig(min=1, max=31, step=1, mode=NumberSelectorMode.BOX)
+                ),
                 vol.Required(
                     CONF_BILL_TIME,
                     default=options.get(CONF_BILL_TIME, DEFAULT_BILL_TIME),

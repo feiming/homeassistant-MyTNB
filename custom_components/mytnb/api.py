@@ -127,6 +127,8 @@ _RM = r"([-−]?\s*RM\s*[-−]?[\d,]+\.\d{2})"
 _NEM_BALANCE_RE = re.compile(r"Baki NEM\s*\n\s*([\d,]+(?:\.\d+)?)\s*kWh")
 _NEM_EXPIRY_RE = re.compile(r"Luput pada\s*(\d{2}\.\d{2}\.\d{4})")
 _NEM_EXPIRY_FALLBACK_RE = re.compile(r"Tarikh Luput[\s\S]{0,200}?(\d{2}\.\d{2}\.\d{4})")
+# The address block: "TARIKH BIL / 02.11.2026 / TEMPOH BIL / 01.10.2026 - 31.10.2026".
+_BILL_DATE_RE = re.compile(r"TARIKH BIL\s*(\d{2}\.\d{2}\.\d{4})", re.IGNORECASE)
 _SUMMARY_RES = {
     "previous_balance": re.compile(r"Baki Terdahulu\s*" + _RM),
     "current_nem_charge": re.compile(r"Caj Semasa NEM\s*" + _RM),
@@ -205,6 +207,7 @@ class MeterReading:
 class BillData:
     """Values extracted from the latest bill PDF. Amounts are in RM."""
 
+    bill_date: date | None = None
     nem_balance_kwh: float | None = None
     nem_expiry: date | None = None
     previous_balance: float | None = None
@@ -232,6 +235,14 @@ def _parse_number(value: str) -> float:
     return float(value.replace(",", ""))
 
 
+def _parse_date(value: str) -> date | None:
+    """'31.12.2026' -> date; None if it isn't a real date."""
+    try:
+        return datetime.strptime(value, "%d.%m.%Y").date()
+    except ValueError:
+        return None
+
+
 def parse_bill_text(pages: list[str]) -> BillData:
     """Extract bill values from the text of each PDF page."""
     page1 = pages[0] if pages else ""
@@ -242,10 +253,11 @@ def parse_bill_text(pages: list[str]) -> BillData:
 
     nem_expiry = None
     if match := (_NEM_EXPIRY_RE.search(page1) or _NEM_EXPIRY_FALLBACK_RE.search(page1)):
-        try:
-            nem_expiry = datetime.strptime(match.group(1), "%d.%m.%Y").date()
-        except ValueError:
-            pass
+        nem_expiry = _parse_date(match.group(1))
+
+    bill_date = None
+    if match := _BILL_DATE_RE.search(page1):
+        bill_date = _parse_date(match.group(1))
 
     summary = {
         key: _parse_rm(match.group(1)) if (match := pattern.search(page1)) else None
@@ -264,7 +276,13 @@ def parse_bill_text(pages: list[str]) -> BillData:
         for match in _METER_RE.finditer("\n".join(pages))
     )
 
-    return BillData(nem_balance_kwh=nem_balance, nem_expiry=nem_expiry, meters=meters, **summary)
+    return BillData(
+        bill_date=bill_date,
+        nem_balance_kwh=nem_balance,
+        nem_expiry=nem_expiry,
+        meters=meters,
+        **summary,
+    )
 
 
 def parse_bill_pdf(pdf: bytes) -> BillData:

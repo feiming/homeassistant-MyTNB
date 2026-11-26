@@ -8,8 +8,8 @@ smartliving dashboard, and feeds it into Home Assistant.
 
 - **Sensors**: latest usage (kWh), latest cost (MYR), month-to-date usage and cost.
 - **Latest bill**: the most recent bill PDF is downloaded on a schedule you
-  choose (daily by default, see [Options](#options)), read, and discarded
-  (nothing is stored). Sensors from it:
+  choose (monthly, on the 1st by default; see [Options](#options)), read, and
+  discarded (nothing is stored). Sensors from it:
 
   | Sensor | On the bill |
   | --- | --- |
@@ -84,11 +84,13 @@ After setup, **Settings → Devices & services → Tenaga Nasional → Configure
 | --- | --- | --- |
 | Polling interval (hours) | 6 | How often smart meter usage and cost are fetched. |
 | Fetch latest bill | on | Turn off to stop downloading bills; the bill sensors are removed. |
-| Check for a new bill every (days) | 1 | Bills are monthly, so daily checks pick up a new one within a day. |
+| Bill check day of the month | 1 | From this day, checks daily until the new bill (dated up to 7 days before it) is in, then waits for next month. Days past a month's end (e.g. 31) fall on its last day. |
 | Bill check time | 09:00 | Malaysia time. Skipped during TNB's nightly maintenance (23:25–00:35). |
 
-The bill is also fetched once when Home Assistant starts, and a failed fetch
-keeps the previous bill's values and is retried on the next poll.
+The bill is also fetched once when Home Assistant starts. A bill is recognised
+by its bill date, so the same bill isn't fetched again and a late bill is still
+picked up the day it appears. A failed fetch keeps the previous bill's values
+and is retried on the next poll.
 
 ## Energy dashboard setup
 

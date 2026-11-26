@@ -11,7 +11,7 @@ from __future__ import annotations
 import importlib
 import sys
 import types
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
@@ -251,42 +251,102 @@ async def test_first_poll_fetches_bill(coordinator, bill, set_now):
 
 
 async def test_bill_not_refetched_before_next_check(coordinator, coordinator_module, bill, set_now):
-    """Default: daily at 09:00. Polls before then reuse the bill."""
-    set_now(2026, 11, 16, 14, 0)
-    await coordinator._async_update_data()
-    assert coordinator.next_bill_check() == datetime(2026, 11, 17, 9, 0, tzinfo=coordinator_module.TIMEZONE)
+    """Default: the 1st of each month at 09:00. Polls before then reuse the bill.
 
-    set_now(2026, 11, 16, 20, 0)
+    The fixture bill has no bill date, so a fetch since the 1st counts as current.
+    """
+    tz = coordinator_module.TIMEZONE
+    now = set_now(2026, 11, 16, 14, 0)
+    await coordinator._async_update_data()
+    assert coordinator.next_bill_check(now) == datetime(2026, 12, 1, 9, 0, tzinfo=tz)
+
+    set_now(2026, 11, 17, 9, 0)
     data = await coordinator._async_update_data()
-    set_now(2026, 11, 17, 8, 59)
+    set_now(2026, 12, 1, 8, 59)
     await coordinator._async_update_data()
 
     assert data.bill is bill
     assert coordinator.client.async_get_bill.await_count == 1
 
-    set_now(2026, 11, 17, 9, 0)
+    now = set_now(2026, 12, 1, 9, 0)
     await coordinator._async_update_data()
     assert coordinator.client.async_get_bill.await_count == 2
+    assert coordinator.next_bill_check(now) == datetime(2027, 1, 1, 9, 0, tzinfo=tz)
 
 
-async def test_bill_interval_and_time_options(coordinator_module, fresh_data, bill, set_now):
+async def test_bill_checked_daily_until_new_bill(coordinator_module, fresh_data, set_now):
+    """From the chosen day, check daily until a bill dated near it arrives."""
+    tz = coordinator_module.TIMEZONE
+    BillData = coordinator_module.BillData
+    november = BillData(bill_date=date(2026, 11, 2), nem_balance_kwh=970.0)
+    december = BillData(bill_date=date(2026, 12, 4), nem_balance_kwh=990.0)
     coord = make_coordinator(
         coordinator_module,
         fresh_data,
-        bill,
+        november,
         **{
-            coordinator_module.CONF_BILL_INTERVAL_DAYS: 7.0,  # NumberSelector gives floats
+            coordinator_module.CONF_BILL_DAY: 3.0,  # NumberSelector gives floats
             coordinator_module.CONF_BILL_TIME: "06:30:00",
         },
     )
-    set_now(2026, 11, 16, 14, 0)
-    await coord._async_update_data()
+    get_bill = coord.client.async_get_bill
 
-    assert coord.next_bill_check() == datetime(
-        2026, 11, 23, 6, 30, tzinfo=coordinator_module.TIMEZONE
+    # Startup: November's bill (dated the 2nd) counts for the cycle from 3 Nov.
+    now = set_now(2026, 11, 16, 14, 0)
+    coord.data = await coord._async_update_data()
+    coord.async_update_listeners = MagicMock()
+    assert coord.next_bill_check(now) == datetime(2026, 12, 3, 6, 30, tzinfo=tz)
+
+    # 3 Dec: still November's bill, so it's checked again the next day...
+    now = set_now(2026, 12, 3, 6, 30)
+    await coord.async_refresh_bill_if_due()
+    assert get_bill.await_count == 2
+    assert coord.next_bill_check(now) == datetime(2026, 12, 4, 6, 30, tzinfo=tz)
+    set_now(2026, 12, 3, 20, 0)
+    await coord._async_update_data()
+    assert get_bill.await_count == 2
+
+    # ...when December's (late) bill is in; then nothing until 3 Jan.
+    get_bill.return_value = december
+    now = set_now(2026, 12, 4, 6, 30)
+    await coord.async_refresh_bill_if_due()
+    assert coord.data.bill is december
+    assert coord.next_bill_check(now) == datetime(2027, 1, 3, 6, 30, tzinfo=tz)
+    set_now(2026, 12, 20, 6, 30)
+    await coord.async_refresh_bill_if_due()
+    assert get_bill.await_count == 3
+
+
+async def test_bill_day_before_bill_arrives(coordinator_module, fresh_data, set_now):
+    """Last month's bill doesn't count, so a day before arrival still works."""
+    tz = coordinator_module.TIMEZONE
+    october = coordinator_module.BillData(bill_date=date(2026, 10, 2))
+    coord = make_coordinator(coordinator_module, fresh_data, october)
+    coord.bill = october
+    coord.bill_fetched_at = datetime(2026, 10, 20, 9, 0, tzinfo=tz)
+
+    assert coord.bill_due(datetime(2026, 11, 1, 9, 0, tzinfo=tz))
+    coord.bill_fetched_at = datetime(2026, 11, 1, 9, 0, tzinfo=tz)
+    assert coord.next_bill_check(datetime(2026, 11, 1, 9, 0, tzinfo=tz)) == datetime(
+        2026, 11, 2, 9, 0, tzinfo=tz
     )
-    assert not coord.bill_due(datetime(2026, 11, 23, 6, 29, tzinfo=coordinator_module.TIMEZONE))
-    assert coord.bill_due(datetime(2026, 11, 23, 6, 30, tzinfo=coordinator_module.TIMEZONE))
+
+
+async def test_bill_day_past_month_end_uses_last_day(coordinator_module, fresh_data, bill):
+    tz = coordinator_module.TIMEZONE
+    coord = make_coordinator(
+        coordinator_module, fresh_data, bill, **{coordinator_module.CONF_BILL_DAY: 31}
+    )
+
+    def next_after_fetch(*args: int) -> datetime:
+        coord.bill_fetched_at = datetime(*args, tzinfo=tz)
+        return coord.next_bill_check(coord.bill_fetched_at)
+
+    assert next_after_fetch(2027, 1, 31, 10, 0) == datetime(2027, 2, 28, 9, 0, tzinfo=tz)
+    assert next_after_fetch(2028, 1, 31, 10, 0) == datetime(2028, 2, 29, 9, 0, tzinfo=tz)
+    assert next_after_fetch(2026, 11, 16, 14, 0) == datetime(2026, 11, 30, 9, 0, tzinfo=tz)
+    assert next_after_fetch(2026, 12, 31, 10, 0) == datetime(2027, 1, 31, 9, 0, tzinfo=tz)
+    assert next_after_fetch(2027, 1, 5, 10, 0) == datetime(2027, 1, 31, 9, 0, tzinfo=tz)
 
 
 async def test_bill_disabled_never_fetches(coordinator_module, fresh_data, bill, set_now):
@@ -309,7 +369,7 @@ async def test_bill_failure_keeps_previous_bill_and_retries_next_poll(
     set_now(2026, 11, 16, 14, 0)
     await coordinator._async_update_data()
 
-    set_now(2026, 11, 17, 9, 0)
+    set_now(2026, 12, 1, 9, 0)
     coordinator.client.async_get_data.return_value = coordinator_module.SmartMeterData(
         usage=[], cost=[]
     )
@@ -319,7 +379,7 @@ async def test_bill_failure_keeps_previous_bill_and_retries_next_poll(
     data = await coordinator._async_update_data()
     assert data.bill is bill
 
-    set_now(2026, 11, 17, 15, 0)  # next poll, same day: still due, so retried
+    set_now(2026, 12, 1, 15, 0)  # next poll, same day: still due, so retried
     coordinator.client.async_get_bill.side_effect = None
     await coordinator._async_update_data()
     assert coordinator.client.async_get_bill.await_count == 3
@@ -347,7 +407,7 @@ async def test_scheduled_check_pushes_new_bill_to_sensors(
 
     new_bill = coordinator_module.BillData(nem_balance_kwh=1000.0)
     coordinator.client.async_get_bill.return_value = new_bill
-    set_now(2026, 11, 17, 9, 0)
+    set_now(2026, 12, 1, 9, 0)
     await coordinator.async_refresh_bill_if_due()
 
     assert coordinator.data.bill is new_bill

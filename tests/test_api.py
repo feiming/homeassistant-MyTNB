@@ -386,6 +386,7 @@ def test_maintenance_window_uses_malaysia_time():
 # Bill
 # --------------------------------------------------------------------------- #
 EXPECTED_BILL = api.BillData(
+    bill_date=date(2026, 11, 2),
     nem_balance_kwh=970.0,
     nem_expiry=date(2026, 12, 31),
     previous_balance=-262.77,

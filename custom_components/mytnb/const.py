@@ -18,11 +18,13 @@ FETCH_WINDOW = timedelta(days=30)
 
 CURRENCY_MYR = "MYR"
 
-# Latest-bill fetching. Bills are issued monthly, so a daily check picks up a
-# new one within a day; users can check less often or turn it off.
+# Latest-bill fetching. Bills are issued monthly: from a chosen day of the
+# month (clamped to its last day) the bill is checked daily until a bill dated
+# no more than NEW_BILL_GRACE before that day is in, then not until next month.
 CONF_BILL_ENABLED = "bill_enabled"
-CONF_BILL_INTERVAL_DAYS = "bill_interval_days"
+CONF_BILL_DAY = "bill_day"
 CONF_BILL_TIME = "bill_time"
 DEFAULT_BILL_ENABLED = True
-DEFAULT_BILL_INTERVAL_DAYS = 1
+DEFAULT_BILL_DAY = 1
+NEW_BILL_GRACE = timedelta(days=7)
 DEFAULT_BILL_TIME = "09:00:00"

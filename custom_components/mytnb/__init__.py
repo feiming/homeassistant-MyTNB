@@ -45,8 +45,8 @@ async def async_setup_entry(hass: HomeAssistant, entry: MyTNBConfigEntry) -> boo
     entry.async_on_unload(entry.add_update_listener(_async_update_listener))
 
     if coordinator.bill_enabled:
-        # Check for a new bill at the configured Malaysia time each day; the
-        # coordinator decides whether the configured number of days has passed.
+        # Fire at the configured Malaysia time each day; the coordinator
+        # decides whether the configured day of the month has come.
         # (Regular polls also catch up on a check missed while HA was down.)
         local = datetime.combine(datetime.now(TIMEZONE).date(), coordinator.bill_time, TIMEZONE)
         fire_at = local.astimezone(dt_util.get_default_time_zone())
