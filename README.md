@@ -47,6 +47,15 @@ You will need:
 
   <img src="docs/images/account-details-smart-meter.png" width="350" alt="myTNB account card with the View Energy Usage link highlighted">
 
+The account must have a TNB **smart meter**; setup reports "MyTNB lists no smart
+meter for this account" otherwise.
+
+> **Malaysian IP required.** myTNB blocks requests from non-Malaysian IP
+> addresses. If Home Assistant reaches the internet through a VPN, proxy, or a
+> host outside Malaysia, updates fail with errors like *"MyTNB session rejected,
+> will retry"*. Check from the HA Terminal add-on with
+> `curl -s ipinfo.io/country` — it should print `MY`.
+
 ## Energy dashboard setup
 
 In *Settings → Dashboards → Energy*, add **Grid consumption** and pick the

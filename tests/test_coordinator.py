@@ -215,3 +215,15 @@ async def test_bad_credentials_still_trigger_reauth(coordinator, coordinator_mod
 
     with pytest.raises(_FakeConfigEntryAuthFailed):
         await coordinator._async_update_data()
+
+
+async def test_no_smart_meter_is_a_clear_update_failure(
+    coordinator, coordinator_module, set_now
+):
+    set_now(2026, 11, 16, 14, 0)
+    coordinator.client.async_get_data.side_effect = coordinator_module.MyTNBNoSmartMeterError(
+        "no meter"
+    )
+
+    with pytest.raises(_FakeUpdateFailed, match="No smart meter found"):
+        await coordinator._async_update_data()

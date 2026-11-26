@@ -56,6 +56,34 @@ async def test_dashboard_never_propagates_raises_auth_error(client, fake_tnb):
     assert not isinstance(exc_info.value, api.MyTNBCredentialsError)
 
 
+NO_METER_DASHBOARD = (
+    '<script>var x = {"billcyclesurn":"/billcycle?orgname=TNB&accountnumber=123",'
+    '"commodities":[]};</script>'
+)
+
+
+async def test_dashboard_without_meter_raises_no_smart_meter(client, fake_tnb):
+    """A logged-in dashboard with no sdpudcid means the account has no meter."""
+    fake_tnb.dashboard_bodies = [NO_METER_DASHBOARD]
+    with pytest.raises(api.MyTNBNoSmartMeterError):
+        await client.async_authenticate()
+
+
+async def test_session_lag_then_meterless_dashboard_is_no_smart_meter(client, fake_tnb):
+    """Lag pages before the real dashboard don't hide the no-meter verdict."""
+    fake_tnb.dashboard_bodies = ["<html>login redirect</html>", NO_METER_DASHBOARD]
+    with pytest.raises(api.MyTNBNoSmartMeterError):
+        await client.async_authenticate()
+
+
+async def test_no_smart_meter_is_not_auth_error(client, fake_tnb):
+    """It must not trigger the re-login loop or a reauth flow."""
+    fake_tnb.dashboard_bodies = [NO_METER_DASHBOARD]
+    with pytest.raises(api.MyTNBError) as exc_info:
+        await client.async_authenticate()
+    assert not isinstance(exc_info.value, api.MyTNBAuthError)
+
+
 async def test_invalid_smartmeter_url_rejected(session):
     with pytest.raises(api.MyTNBError):
         api.MyTNBClient(session, "user@example.com", "secret", "https://example.com/nope")
