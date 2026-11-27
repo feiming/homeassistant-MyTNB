@@ -7,7 +7,14 @@ from zoneinfo import ZoneInfo
 
 import pytest
 
-from conftest import DASHBOARD_PAGE, LOGIN_REDIRECT_JSON, SDPUDCID, SMARTMETER_URL, api
+from conftest import (
+    DASHBOARD_PAGE,
+    LOGIN_REDIRECT_JSON,
+    SDPUDCID,
+    SESSION_COOKIE_VALUE,
+    SMARTMETER_URL,
+    api,
+)
 
 START = datetime(2026, 6, 14, tzinfo=api.TIMEZONE)
 END = datetime(2026, 7, 15, tzinfo=api.TIMEZONE)
@@ -163,6 +170,35 @@ async def test_each_poll_logs_in_fresh(client, fake_tnb):
     assert len(data.cost) == 1
     # one armed request per metric per poll: no doomed attempt on a stale session
     assert fake_tnb.commodity_visits == ["usage", "cost", "usage", "cost"]
+
+
+async def test_rejection_is_logged_with_diagnostics(client, fake_tnb, monkeypatch, caplog):
+    """A rejected session logs why at WARNING, without leaking secrets (issue #6)."""
+    monkeypatch.setattr(api, "_SESSION_LAG_RETRIES", 1)
+    fake_tnb.timeseries = {
+        "usage": [{**LOGIN_REDIRECT_JSON, "errorMessage": "Session timed out"}],
+        "cost": [COST_OK],
+    }
+
+    with caplog.at_level("DEBUG", logger="mytnb_api"), pytest.raises(api.MyTNBAuthError):
+        await client.async_get_data(START, END)
+
+    warnings = [r.getMessage() for r in caplog.records if r.levelname == "WARNING"]
+    # one warning per login: the up-front one and the retry
+    assert len(warnings) == 2
+    last = warnings[-1]
+    assert "redirectTo='/login'" in last
+    assert "errorMessage='Session timed out'" in last
+    assert "/my_energy_request/timeseries" in last
+    assert "/commodity/electric/usage" in last
+    assert "login #2" in last
+    assert "since login" in last
+    assert "ASP.NET_SessionId" in last  # cookie names are shown...
+
+    everything = caplog.text
+    assert SESSION_COOKIE_VALUE not in everything  # ...but never their values
+    assert "secret" not in everything  # the password
+    assert "caNo=" not in everything  # query strings are dropped
 
 
 async def test_one_metric_failing_is_tolerated(client, fake_tnb):

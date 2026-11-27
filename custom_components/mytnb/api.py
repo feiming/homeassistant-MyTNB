@@ -20,8 +20,10 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
+from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import datetime, time, timedelta
+from time import monotonic
 from typing import Any
 from zoneinfo import ZoneInfo
 
@@ -85,6 +87,11 @@ class MyTNBError(Exception):
 class MyTNBAuthError(MyTNBError):
     """Credentials rejected, or the session is missing/expired."""
 
+    def __init__(self, message: str, trace: str = "") -> None:
+        """Keep where the rejected request ended up, for diagnostics."""
+        super().__init__(message)
+        self.trace = trace
+
 
 class MyTNBCredentialsError(MyTNBAuthError):
     """The login form itself rejected the email/password."""
@@ -134,6 +141,39 @@ def extract_smartmeter_path(smartmeter_url: str) -> str:
     return match.group(0)
 
 
+# Response headers that identify the CDN/WAF/backend that answered, which is
+# what tells a TNB-side rejection apart from a session problem on our side.
+_TRACE_HEADERS = ("server", "via", "x-cache", "x-azure-ref", "cf-ray", "x-amz-cf-pop")
+
+
+def _describe_hop(response: aiohttp.ClientResponse) -> str:
+    """One hop as 'STATUS host/path', plus cookies set and edge headers.
+
+    Query strings are dropped (they carry the caNo and sdpudcid) and only
+    cookie names are shown, never values, so this is safe to log.
+    """
+    url = response.url
+    parts = [f"{response.status} {url.host}{url.path}"]
+    if set_cookies := sorted({c.key for c in response.cookies.values()}):
+        parts.append(f"set-cookie={','.join(set_cookies)}")
+    edge = [f"{h}={response.headers[h]}" for h in _TRACE_HEADERS if h in response.headers]
+    if edge:
+        parts.append(" ".join(edge))
+    return " ".join(parts)
+
+
+def _describe_chain(
+    history: Sequence[aiohttp.ClientResponse], final: aiohttp.ClientResponse | None = None
+) -> str:
+    """The redirect chain of a request, first hop first."""
+    hops = [*history, final] if final is not None else list(history)
+    return " -> ".join(_describe_hop(hop) for hop in hops) or "(no response)"
+
+
+def _is_login_url(url: Any) -> bool:
+    return "login" in str(getattr(url, "path", "")).lower()
+
+
 class MyTNBClient:
     """Client for the MyTNB smart meter portal.
 
@@ -154,6 +194,22 @@ class MyTNBClient:
         self._smartmeter_path = extract_smartmeter_path(smartmeter_url)
         self._auth_lock = asyncio.Lock()
         self.sdpudcid: str | None = None
+        # For diagnostics only: which login this is and when it happened.
+        self._login_count = 0
+        self._login_at: float | None = None
+
+    def _session_state(self) -> str:
+        """Login number, session age and cookie names held, for diagnostics."""
+        age = "never logged in"
+        if self._login_at is not None:
+            age = f"{monotonic() - self._login_at:.1f}s since login"
+        by_domain: dict[str, set[str]] = {}
+        for morsel in self._session.cookie_jar:
+            by_domain.setdefault(morsel["domain"] or "(host-only)", set()).add(morsel.key)
+        cookies = "; ".join(
+            f"{domain}: {','.join(sorted(names))}" for domain, names in sorted(by_domain.items())
+        )
+        return f"login #{self._login_count}, {age}, cookies=[{cookies or 'none'}]"
 
     async def async_authenticate(self) -> str:
         """Run the full login flow; returns the meter's sdpudcid."""
@@ -188,6 +244,8 @@ class MyTNBClient:
         """Login → SSO → smartmeter page → dashboard (sdpudcid)."""
         self.sdpudcid = None
         self._session.cookie_jar.clear()
+        self._login_count += 1
+        self._login_at = monotonic()
 
         try:
             async with self._session.post(
@@ -195,37 +253,69 @@ class MyTNBClient:
             ) as response:
                 response.raise_for_status()
                 form_fields = dict(_FORM_FIELD_RE.findall(await response.text()))
+                _LOGGER.debug(
+                    "Login #%d: login form: %s (sso fields=%s)",
+                    self._login_count,
+                    _describe_chain(response.history, response),
+                    ",".join(sorted(form_fields)) or "none",
+                )
             if not form_fields:
                 raise MyTNBCredentialsError(
                     "Login page returned no SSO form fields (bad credentials?)"
                 )
 
             async with self._session.post(_SSO_URL, data=form_fields) as response:
+                _LOGGER.debug(
+                    "Login #%d: SSO handler: %s",
+                    self._login_count,
+                    _describe_chain(response.history, response),
+                )
                 if response.status != 200:
                     raise MyTNBAuthError(f"SSO handler rejected login with status {response.status}")
 
             async with self._session.get(f"{_ACCOUNT_BASE}{self._smartmeter_path}") as response:
+                _LOGGER.debug(
+                    "Login #%d: smartmeter page: %s",
+                    self._login_count,
+                    _describe_chain(response.history, response),
+                )
                 if response.status != 200:
                     raise MyTNBConnectionError(
                         f"Smartmeter page returned status {response.status}"
                     )
+        except aiohttp.TooManyRedirects as err:
+            _LOGGER.warning(
+                "Login #%d stuck in a redirect loop: %s",
+                self._login_count,
+                _describe_chain(err.history),
+            )
+            raise MyTNBConnectionError(f"Login flow failed: {err}") from err
         except aiohttp.ClientError as err:
             raise MyTNBConnectionError(f"Login flow failed: {err}") from err
 
         self.sdpudcid = await self._fetch_sdpudcid()
-        _LOGGER.debug("Login flow completed; sdpudcid=%s", self.sdpudcid)
+        _LOGGER.debug(
+            "Login flow completed; sdpudcid=%s; %s", self.sdpudcid, self._session_state()
+        )
 
     async def _fetch_sdpudcid(self) -> str:
         """Load the smartliving dashboard and extract the meter id."""
         account_page = False
+        trace = "(no response)"
         for attempt in range(_SESSION_LAG_RETRIES):
             try:
                 async with self._session.get(_DASHBOARD_URL, headers=_HTML_HEADERS) as response:
+                    trace = _describe_chain(response.history, response)
                     if response.status in (401, 403):
                         # The WAF can reject a request while a fresh session
                         # is still propagating, same as the redirect loop
                         # below; retry before treating it as a dead session.
                         if attempt == _SESSION_LAG_RETRIES - 1:
+                            _LOGGER.warning(
+                                "MyTNB dashboard rejected the session: %s; %s",
+                                trace,
+                                self._session_state(),
+                            )
                             raise MyTNBAuthError(
                                 f"Dashboard request rejected with status {response.status}"
                             )
@@ -233,12 +323,11 @@ class MyTNBClient:
                     else:
                         response.raise_for_status()
                         text = await response.text()
-                    final_url = response.url
-            except aiohttp.TooManyRedirects:
+            except aiohttp.TooManyRedirects as err:
                 # A login redirect loop happens both for dead sessions and
                 # transiently while a fresh session propagates; retry.
                 text = ""
-                final_url = None
+                trace = f"redirect loop: {_describe_chain(err.history)}"
             except aiohttp.ClientError as err:
                 raise MyTNBConnectionError(f"Dashboard request failed: {err}") from err
 
@@ -247,13 +336,13 @@ class MyTNBClient:
 
             account_page = bool(_ACCOUNT_MARKER_RE.search(text))
             _LOGGER.debug(
-                "No sdpudcid in dashboard response (attempt %d/%d, url=%s, "
-                "length=%d, account_page=%s)",
+                "No sdpudcid in dashboard response (attempt %d/%d, length=%d, "
+                "account_page=%s): %s",
                 attempt + 1,
                 _SESSION_LAG_RETRIES,
-                final_url,
                 len(text),
                 account_page,
+                trace,
             )
             if attempt < _SESSION_LAG_RETRIES - 1:
                 await asyncio.sleep(_SESSION_LAG_DELAY)
@@ -262,6 +351,12 @@ class MyTNBClient:
             raise MyTNBNoSmartMeterError(
                 "Logged in, but the MyTNB dashboard lists no smart meter for this account"
             )
+        _LOGGER.warning(
+            "MyTNB dashboard never returned the meter after %d attempts; last response: %s; %s",
+            _SESSION_LAG_RETRIES,
+            trace,
+            self._session_state(),
+        )
         raise MyTNBAuthError(
             f"No sdpudcid in dashboard response after {_SESSION_LAG_RETRIES} attempts"
         )
@@ -314,22 +409,41 @@ class MyTNBClient:
         if granularity:
             params["granularity"] = granularity
 
+        commodity_trace = timeseries_trace = "(no response)"
+        redirect_info = ""
         for attempt in range(_SESSION_LAG_RETRIES):
             try:
-                await self._visit_commodity_page(metric)
-            except MyTNBAuthError:
+                commodity_trace = await self._visit_commodity_page(metric)
+            except MyTNBAuthError as err:
                 # Redirect loops on the commodity page are transient during
                 # session propagation, same as the redirect-JSON below.
                 if attempt < _SESSION_LAG_RETRIES - 1:
                     await asyncio.sleep(_SESSION_LAG_DELAY)
                     continue
+                _LOGGER.warning(
+                    "MyTNB %s commodity page kept rejecting the session after %d attempts: "
+                    "%s; %s",
+                    metric,
+                    _SESSION_LAG_RETRIES,
+                    err.trace or "(no trace)",
+                    self._session_state(),
+                )
                 raise
 
             try:
                 async with self._session.get(
                     _TIMESERIES_URL, headers=headers, params=params
                 ) as response:
+                    timeseries_trace = _describe_chain(response.history, response)
                     if response.status in (401, 403):
+                        _LOGGER.warning(
+                            "MyTNB %s timeseries rejected the session: %s; "
+                            "commodity page: %s; %s",
+                            metric,
+                            timeseries_trace,
+                            commodity_trace,
+                            self._session_state(),
+                        )
                         raise MyTNBAuthError(
                             f"Timeseries request rejected with status {response.status}"
                         )
@@ -339,6 +453,15 @@ class MyTNBClient:
                     except aiohttp.ContentTypeError as err:
                         # An expired session is served the HTML login page
                         # with status 200.
+                        _LOGGER.warning(
+                            "MyTNB %s timeseries returned %s instead of JSON: %s; "
+                            "commodity page: %s; %s",
+                            metric,
+                            response.content_type,
+                            timeseries_trace,
+                            commodity_trace,
+                            self._session_state(),
+                        )
                         raise MyTNBAuthError("Timeseries endpoint returned non-JSON") from err
             except MyTNBError:
                 raise
@@ -350,34 +473,69 @@ class MyTNBClient:
                 _LOGGER.debug("%s: fetched %d points", metric, len(points))
                 return points
 
+            # Everything TNB says about the redirect, minus the (empty) data.
+            redirect_info = ", ".join(
+                f"{key}={payload[key]!r}"
+                for key in ("redirectTo", "errorMessage", "errors", "fieldErrors")
+                if payload.get(key)
+            )
             _LOGGER.debug(
-                "Timeseries %s redirected to %s (attempt %d/%d)",
+                "Timeseries %s redirected (attempt %d/%d): %s; timeseries: %s; "
+                "commodity page: %s; %s",
                 metric,
-                payload.get("redirectTo"),
                 attempt + 1,
                 _SESSION_LAG_RETRIES,
+                redirect_info,
+                timeseries_trace,
+                commodity_trace,
+                self._session_state(),
             )
             if attempt < _SESSION_LAG_RETRIES - 1:
                 await asyncio.sleep(_SESSION_LAG_DELAY)
 
+        _LOGGER.warning(
+            "MyTNB %s timeseries kept redirecting to login after %d attempts: %s; "
+            "timeseries: %s; commodity page: %s; %s",
+            metric,
+            _SESSION_LAG_RETRIES,
+            redirect_info,
+            timeseries_trace,
+            commodity_trace,
+            self._session_state(),
+        )
         raise MyTNBAuthError(
             f"Timeseries {metric} kept redirecting to login after {_SESSION_LAG_RETRIES} attempts"
         )
 
-    async def _visit_commodity_page(self, metric: str) -> None:
-        """Load the commodity page for a metric to arm the timeseries endpoint."""
+    async def _visit_commodity_page(self, metric: str) -> str:
+        """Load the commodity page for a metric to arm the timeseries endpoint.
+
+        Returns a description of where the request ended up, for diagnostics.
+        """
         url = f"{_SMARTLIVING_BASE}/commodity/electric/{metric}"
         try:
             async with self._session.get(url, headers=_HTML_HEADERS) as response:
+                trace = _describe_chain(response.history, response)
                 if response.status in (401, 403):
                     raise MyTNBAuthError(
-                        f"Commodity page rejected with status {response.status}"
+                        f"Commodity page rejected with status {response.status}", trace
                     )
                 response.raise_for_status()
         except aiohttp.TooManyRedirects as err:
-            raise MyTNBAuthError("Commodity page stuck in a login redirect loop") from err
+            raise MyTNBAuthError(
+                "Commodity page stuck in a login redirect loop",
+                f"redirect loop: {_describe_chain(err.history)}",
+            ) from err
         except aiohttp.ClientError as err:
             raise MyTNBConnectionError(f"Commodity page request failed: {err}") from err
+
+        if _is_login_url(response.url):
+            # Served with 200, so the request "succeeds", but the endpoint was
+            # not armed: the timeseries request that follows will be bounced.
+            _LOGGER.debug("Commodity page %s landed on a login page: %s", metric, trace)
+        else:
+            _LOGGER.debug("Commodity page %s: %s", metric, trace)
+        return trace
 
     @staticmethod
     def _parse_points(payload: Any) -> list[EnergyPoint]:
