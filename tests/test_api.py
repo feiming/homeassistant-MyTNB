@@ -146,6 +146,25 @@ async def test_expired_session_triggers_relogin(client, fake_tnb, monkeypatch):
     assert len(data.cost) == 1
 
 
+async def test_each_poll_logs_in_fresh(client, fake_tnb):
+    """A later poll must not reuse the earlier, long-expired session (issue #6).
+
+    Fetching with the stale session first left running installs stuck in a
+    login redirect loop while a reload (fresh login) worked, so every poll
+    logs in before its first request, exactly like startup.
+    """
+    fake_tnb.timeseries = {"usage": [USAGE_OK], "cost": [COST_OK]}
+
+    await client.async_get_data(START, END)
+    data = await client.async_get_data(START, END)
+
+    assert fake_tnb.login_count == 2
+    assert len(data.usage) == 1
+    assert len(data.cost) == 1
+    # one armed request per metric per poll: no doomed attempt on a stale session
+    assert fake_tnb.commodity_visits == ["usage", "cost", "usage", "cost"]
+
+
 async def test_one_metric_failing_is_tolerated(client, fake_tnb):
     """A transient 500 on one metric returns empty for it, keeps the other."""
     fake_tnb.timeseries = {"usage": [USAGE_OK], "cost": [500]}

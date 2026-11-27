@@ -153,7 +153,6 @@ class MyTNBClient:
         self._password = password
         self._smartmeter_path = extract_smartmeter_path(smartmeter_url)
         self._auth_lock = asyncio.Lock()
-        self._authenticated = False
         self.sdpudcid: str | None = None
 
     async def async_authenticate(self) -> str:
@@ -164,26 +163,29 @@ class MyTNBClient:
         return self.sdpudcid
 
     async def async_get_data(self, start: datetime, end: datetime) -> SmartMeterData:
-        """Fetch usage and cost, logging in (or re-logging-in) as needed."""
-        await self._ensure_authenticated()
+        """Fetch usage and cost on a freshly logged-in session.
+
+        Every fetch starts with a full login rather than reusing the session
+        from the previous poll (issue #6). Polls are hours apart, so that
+        session has always expired by then. Fetching with it first and only
+        re-logging-in after the rejection left a running integration failing
+        every poll, while a reload (which logs in before fetching) worked.
+        Logging in up front sends every poll down the same path as startup.
+        """
+        await self._relogin()
         try:
             return await self._fetch_all(start, end)
         except MyTNBAuthError as err:
             _LOGGER.debug("Session rejected (%s); logging in again", err)
-            self._authenticated = False
-            await self._ensure_authenticated()
+            await self._relogin()
             return await self._fetch_all(start, end)
 
-    async def _ensure_authenticated(self) -> None:
-        if self._authenticated:
-            return
+    async def _relogin(self) -> None:
         async with self._auth_lock:
-            if not self._authenticated:
-                await self._login()
+            await self._login()
 
     async def _login(self) -> None:
         """Login → SSO → smartmeter page → dashboard (sdpudcid)."""
-        self._authenticated = False
         self.sdpudcid = None
         self._session.cookie_jar.clear()
 
@@ -211,7 +213,6 @@ class MyTNBClient:
             raise MyTNBConnectionError(f"Login flow failed: {err}") from err
 
         self.sdpudcid = await self._fetch_sdpudcid()
-        self._authenticated = True
         _LOGGER.debug("Login flow completed; sdpudcid=%s", self.sdpudcid)
 
     async def _fetch_sdpudcid(self) -> str:
