@@ -201,6 +201,29 @@ async def test_rejection_is_logged_with_diagnostics(client, fake_tnb, monkeypatc
     assert "caNo=" not in everything  # query strings are dropped
 
 
+def test_safe_error_strips_query_strings():
+    """aiohttp puts the full URL, caNo/sdpudcid included, in its errors."""
+    err = Exception(
+        "500, message='Internal Server Error', url='https://myaccount.mytnb.com.my"
+        "/AccountManagement/SmartMeter/Index/TRIL?caNo=220012345678'"
+    )
+    safe = api._safe_error(err)
+    assert "220012345678" not in safe
+    assert "myaccount.mytnb.com.my/AccountManagement/SmartMeter/Index/TRIL'" in safe
+
+
+async def test_http_errors_do_not_log_meter_id(client, fake_tnb, caplog):
+    """A 500 from TNB is logged without the sdpudcid from the request URL."""
+    fake_tnb.timeseries = {"usage": [USAGE_OK], "cost": [500]}
+
+    with caplog.at_level("WARNING", logger="mytnb_api"):
+        await client.async_get_data(START, END)
+
+    assert "Fetching cost failed" in caplog.text
+    assert "500" in caplog.text
+    assert SDPUDCID not in caplog.text
+
+
 async def test_one_metric_failing_is_tolerated(client, fake_tnb):
     """A transient 500 on one metric returns empty for it, keeps the other."""
     fake_tnb.timeseries = {"usage": [USAGE_OK], "cost": [500]}

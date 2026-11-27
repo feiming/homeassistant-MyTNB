@@ -170,6 +170,18 @@ def _describe_chain(
     return " -> ".join(_describe_hop(hop) for hop in hops) or "(no response)"
 
 
+_URL_QUERY_RE = re.compile(r"(https?://[^\s'\"?]+)\?[^\s'\"]*")
+
+
+def _safe_error(err: Exception) -> str:
+    """An aiohttp error's text with URL query strings removed.
+
+    aiohttp includes the full request URL in its error messages, and ours
+    carry the contract account number (caNo) and the meter id (sdpudcid).
+    """
+    return _URL_QUERY_RE.sub(r"\1", str(err))
+
+
 def _is_login_url(url: Any) -> bool:
     return "login" in str(getattr(url, "path", "")).lower()
 
@@ -289,9 +301,9 @@ class MyTNBClient:
                 self._login_count,
                 _describe_chain(err.history),
             )
-            raise MyTNBConnectionError(f"Login flow failed: {err}") from err
+            raise MyTNBConnectionError(f"Login flow failed: {_safe_error(err)}") from err
         except aiohttp.ClientError as err:
-            raise MyTNBConnectionError(f"Login flow failed: {err}") from err
+            raise MyTNBConnectionError(f"Login flow failed: {_safe_error(err)}") from err
 
         self.sdpudcid = await self._fetch_sdpudcid()
         _LOGGER.debug(
@@ -329,7 +341,7 @@ class MyTNBClient:
                 text = ""
                 trace = f"redirect loop: {_describe_chain(err.history)}"
             except aiohttp.ClientError as err:
-                raise MyTNBConnectionError(f"Dashboard request failed: {err}") from err
+                raise MyTNBConnectionError(f"Dashboard request failed: {_safe_error(err)}") from err
 
             if match := _SDPUDCID_RE.search(text):
                 return match.group(1)
@@ -466,7 +478,7 @@ class MyTNBClient:
             except MyTNBError:
                 raise
             except aiohttp.ClientError as err:
-                raise MyTNBConnectionError(f"Timeseries request failed: {err}") from err
+                raise MyTNBConnectionError(f"Timeseries request failed: {_safe_error(err)}") from err
 
             if not (isinstance(payload, dict) and payload.get("redirect")):
                 points = self._parse_points(payload)
@@ -527,7 +539,7 @@ class MyTNBClient:
                 f"redirect loop: {_describe_chain(err.history)}",
             ) from err
         except aiohttp.ClientError as err:
-            raise MyTNBConnectionError(f"Commodity page request failed: {err}") from err
+            raise MyTNBConnectionError(f"Commodity page request failed: {_safe_error(err)}") from err
 
         if _is_login_url(response.url):
             # Served with 200, so the request "succeeds", but the endpoint was
