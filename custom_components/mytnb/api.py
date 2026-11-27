@@ -414,13 +414,21 @@ class MyTNBClient:
         )
 
     async def _fetch_all(self, start: datetime, end: datetime) -> SmartMeterData:
-        """Fetch both metrics, tolerating a transient failure of one."""
-        errors: list[MyTNBConnectionError] = []
+        """Fetch both metrics, tolerating a failure of one.
+
+        That includes one metric being bounced to login: if the other one
+        was fetched on the same session, the session is fine, and TNB has
+        been rejecting just the cost request while usage works (issue #6).
+        Failing the whole poll for that threw away the usage data too, so
+        nothing updated. Only when both fail does the error propagate (an
+        auth error first, so the caller logs in again).
+        """
+        errors: list[MyTNBError] = []
 
         async def fetch(metric: str, granularity: str | None) -> list[EnergyPoint]:
             try:
                 return await self._fetch_metric(metric, granularity, start, end)
-            except MyTNBConnectionError as err:
+            except (MyTNBConnectionError, MyTNBAuthError) as err:
                 _LOGGER.warning("Fetching %s failed: %s", metric, err)
                 errors.append(err)
                 return []
@@ -430,7 +438,7 @@ class MyTNBClient:
         cost = await fetch("cost", None)
 
         if len(errors) == 2:
-            raise errors[0]
+            raise next((e for e in errors if isinstance(e, MyTNBAuthError)), errors[0])
         return SmartMeterData(usage=usage, cost=cost)
 
     async def _fetch_metric(

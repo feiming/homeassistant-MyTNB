@@ -94,6 +94,15 @@ class MyTNBCoordinator(DataUpdateCoordinator[SmartMeterData]):
 
         await self._async_insert_statistics("usage", data.usage, UnitOfEnergy.KILO_WATT_HOUR)
         await self._async_insert_statistics("cost", data.cost, CURRENCY_MYR)
+
+        # One metric can fail while the other is fetched (issue #6: TNB
+        # bouncing just the cost request). Keep showing that metric's last
+        # good data rather than blanking its sensors until it recovers.
+        if self.data is not None:
+            if not data.usage:
+                data.usage = self.data.usage
+            if not data.cost:
+                data.cost = self.data.cost
         return data
 
     async def _async_insert_statistics(

@@ -119,6 +119,26 @@ def coordinator(coordinator_module, fresh_data):
     return coord
 
 
+async def test_failed_metric_keeps_its_last_data(coordinator, coordinator_module, set_now):
+    """Issue #6: cost bounced while usage fetched keeps showing the old cost."""
+    point = coordinator_module.EnergyPoint
+    old_cost = [point(start=datetime(2026, 11, 14, tzinfo=coordinator_module.TIMEZONE), value=9.5)]
+    new_usage = [point(start=datetime(2026, 11, 15, tzinfo=coordinator_module.TIMEZONE), value=1.2)]
+    coordinator.data = coordinator_module.SmartMeterData(usage=[], cost=old_cost)
+    coordinator.client.async_get_data.return_value = coordinator_module.SmartMeterData(
+        usage=new_usage, cost=[]
+    )
+    set_now(2026, 11, 16, 14, 0)
+
+    data = await coordinator._async_update_data()
+
+    assert data.usage == new_usage
+    assert data.cost == old_cost
+    # only freshly fetched points go to statistics, never the carried-over ones
+    imported = {c.args[0]: c.args[1] for c in coordinator._async_insert_statistics.await_args_list}
+    assert imported == {"usage": new_usage, "cost": []}
+
+
 async def test_poll_outside_window_fetches(coordinator, fresh_data, set_now):
     set_now(2026, 11, 16, 14, 0)
 

@@ -145,7 +145,7 @@ async def test_expired_session_triggers_relogin(client, fake_tnb, monkeypatch):
     monkeypatch.setattr(api, "_SESSION_LAG_RETRIES", 1)
     fake_tnb.timeseries = {
         "usage": [LOGIN_REDIRECT_JSON, USAGE_OK],
-        "cost": [COST_OK],
+        "cost": [LOGIN_REDIRECT_JSON, COST_OK],
     }
 
     data = await client.async_get_data(START, END)
@@ -203,13 +203,17 @@ async def test_rejection_is_logged_with_diagnostics(client, fake_tnb, monkeypatc
     monkeypatch.setattr(api, "_SESSION_LAG_RETRIES", 1)
     fake_tnb.timeseries = {
         "usage": [{**LOGIN_REDIRECT_JSON, "errorMessage": "Session timed out"}],
-        "cost": [COST_OK],
+        "cost": [LOGIN_REDIRECT_JSON],
     }
 
     with caplog.at_level("DEBUG", logger="mytnb_api"), pytest.raises(api.MyTNBAuthError):
         await client.async_get_data(START, END)
 
-    warnings = [r.getMessage() for r in caplog.records if r.levelname == "WARNING"]
+    warnings = [
+        r.getMessage()
+        for r in caplog.records
+        if r.levelname == "WARNING" and r.getMessage().startswith("MyTNB usage timeseries")
+    ]
     # one warning per login: the up-front one and the retry
     assert len(warnings) == 2
     last = warnings[-1]
@@ -259,6 +263,22 @@ async def test_http_errors_do_not_log_meter_id(client, fake_tnb, caplog):
     assert SDPUDCID not in caplog.text
 
 
+async def test_one_metric_bounced_to_login_keeps_the_other(client, fake_tnb, monkeypatch):
+    """Issue #6: TNB bounces cost to login while usage works on the same session.
+
+    That must not throw away the usage data (nothing updated at all), nor
+    trigger a re-login, since the session was evidently fine.
+    """
+    monkeypatch.setattr(api, "_SESSION_LAG_RETRIES", 1)
+    fake_tnb.timeseries = {"usage": [USAGE_OK], "cost": [LOGIN_REDIRECT_JSON]}
+
+    data = await client.async_get_data(START, END)
+
+    assert len(data.usage) == 1
+    assert data.cost == []
+    assert fake_tnb.login_count == 1
+
+
 async def test_one_metric_failing_is_tolerated(client, fake_tnb):
     """A transient 500 on one metric returns empty for it, keeps the other."""
     fake_tnb.timeseries = {"usage": [USAGE_OK], "cost": [500]}
@@ -277,8 +297,8 @@ async def test_both_metrics_failing_raises(client, fake_tnb):
 
 
 async def test_forbidden_timeseries_is_auth_error(client, fake_tnb):
-    """401/403 must not be swallowed by the partial-failure tolerance."""
-    fake_tnb.timeseries = {"usage": [403], "cost": [COST_OK]}
+    """401/403 on both metrics is a dead session: re-login once, then raise."""
+    fake_tnb.timeseries = {"usage": [403], "cost": [403]}
 
     with pytest.raises(api.MyTNBAuthError):
         # relogin is attempted once, then the auth error surfaces
@@ -289,7 +309,7 @@ async def test_forbidden_timeseries_is_auth_error(client, fake_tnb):
 async def test_timeseries_redirect_loop_is_not_credentials_error(client, fake_tnb, monkeypatch):
     """A persistent login redirect on timeseries is a session problem, not a bad password."""
     monkeypatch.setattr(api, "_SESSION_LAG_RETRIES", 1)
-    fake_tnb.timeseries = {"usage": [LOGIN_REDIRECT_JSON], "cost": [COST_OK]}
+    fake_tnb.timeseries = {"usage": [LOGIN_REDIRECT_JSON], "cost": [LOGIN_REDIRECT_JSON]}
 
     with pytest.raises(api.MyTNBAuthError) as exc_info:
         await client.async_get_data(START, END)
