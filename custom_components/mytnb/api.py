@@ -188,6 +188,11 @@ def _describe_hop(response: aiohttp.ClientResponse) -> str:
     """
     url = response.url
     parts = [f"{response.status} {url.host}{url.path}"]
+    # Names of the cookies this request carried: shows whether a token the
+    # previous response issued was actually sent back.
+    sent = response.request_info.headers.get("Cookie", "")
+    sent_names = sorted({c.split("=", 1)[0].strip() for c in sent.split(";") if c.strip()})
+    parts.append(f"sent={','.join(sent_names) or 'none'}")
     if set_cookies := [
         _describe_set_cookie(m) for m in sorted(response.cookies.values(), key=lambda m: m.key)
     ]:
@@ -378,6 +383,7 @@ class MyTNBClient:
                 raise MyTNBConnectionError(f"Dashboard request failed: {_safe_error(err)}") from err
 
             if match := _SDPUDCID_RE.search(text):
+                _LOGGER.debug("Dashboard: %s; %s", trace, self._session_state())
                 return match.group(1)
 
             account_page = bool(_ACCOUNT_MARKER_RE.search(text))

@@ -225,6 +225,9 @@ async def test_rejection_is_logged_with_diagnostics(client, fake_tnb, monkeypatc
     issued = f"set-cookie=e3AuthToken(len={len(AUTH_TOKEN)};chars=+/=;path=/)"
     assert issued in last
     assert "set-cookie=e3AuthToken(empty;path=/;max-age=0" in last
+    # ...and which cookies each request carried, by name
+    assert "/my_energy_request/timeseries sent=ASP.NET_SessionId,e3AuthToken " in last
+    assert "Dashboard: 200 localhost/dashboard sent=ASP.NET_SessionId" in everything_debug(caplog)
 
     everything = caplog.text
     assert SESSION_COOKIE_VALUE not in everything  # ...but never their values
@@ -330,3 +333,7 @@ def test_maintenance_window_uses_malaysia_time():
     # 16:15 UTC is 00:15 the next day in Malaysia.
     end = api.maintenance_window_end(datetime(2026, 7, 15, 16, 15, tzinfo=ZoneInfo("UTC")))
     assert end == datetime(2026, 7, 16, 0, 35, tzinfo=api.TIMEZONE)
+
+
+def everything_debug(caplog) -> str:
+    return "\n".join(r.getMessage() for r in caplog.records)
