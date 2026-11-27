@@ -10,6 +10,7 @@ localhost (aiohttp's TestServer) and point the client's URLs at it.
 from __future__ import annotations
 
 import importlib.util
+import re
 import sys
 from pathlib import Path
 
@@ -31,6 +32,9 @@ SMARTMETER_URL = (
     "https://myaccount.mytnb.com.my/AccountManagement/SmartMeter/Index/TRIL?caNo=TESTCA"
 )
 SESSION_COOKIE_VALUE = "sessioncookievalue123"
+# base64, so it holds the characters aiohttp quotes by default
+AUTH_TOKEN = "eyJ0b2tlbiI6+dGVzdC/9Qw=="
+_RAW_AUTH_TOKEN_RE = re.compile(r"(?:^|;\s*)e3AuthToken=([^;]*)")
 LOGIN_REDIRECT_JSON = {
     "data": [],
     "html": "",
@@ -87,17 +91,24 @@ class FakeTNB:
 
     async def _commodity(self, request: web.Request) -> web.Response:
         self.commodity_visits.append(request.match_info["metric"])
-        return web.Response(text="", content_type="text/html")
+        response = web.Response(text="", content_type="text/html")
+        response.set_cookie("e3AuthToken", AUTH_TOKEN)
+        return response
 
     async def _timeseries(self, request: web.Request) -> web.Response:
-        metric = request.query.get("metric", "")
-        entry = self._pop(self.timeseries[metric])
+        # Like TNB's smartliving site (issue #6): the auth token must come
+        # back exactly as issued (browsers never quote cookie values), or the
+        # request is bounced to login and the token deleted.
+        match = _RAW_AUTH_TOKEN_RE.search(request.headers.get("Cookie", ""))
+        if not match or match.group(1) != AUTH_TOKEN:
+            entry: dict | int = LOGIN_REDIRECT_JSON
+        else:
+            entry = self._pop(self.timeseries[request.query.get("metric", "")])
         if isinstance(entry, int):
             return web.Response(status=entry)
         response = web.json_response(entry)
         if entry.get("redirect"):
-            # Like TNB (issue #6): bounce to login and delete the auth cookie.
-            response.del_cookie("ASP.NET_SessionId")
+            response.del_cookie("e3AuthToken")
         return response
 
 
@@ -111,18 +122,19 @@ def fast_retries(monkeypatch):
 async def fake_tnb():
     """The fake portal, running on localhost."""
     fake = FakeTNB()
-    server = TestServer(fake.app)
+    server = TestServer(fake.app, host="127.0.0.1")
     await server.start_server()
-    fake.base_url = str(server.make_url("")).rstrip("/")
+    # Addressed by name, not IP: aiohttp's cookie jar ignores cookies from
+    # IP addresses, and the client must run on the production cookie jar.
+    fake.base_url = f"http://localhost:{server.port}"
     yield fake
     await server.close()
 
 
 @pytest.fixture
 async def session():
-    # unsafe=True: the fake portal runs on 127.0.0.1, and aiohttp's cookie
-    # jar otherwise drops cookies from IP addresses.
-    async with aiohttp.ClientSession(cookie_jar=aiohttp.CookieJar(unsafe=True)) as client_session:
+    # The same cookie jar the integration gives its session.
+    async with aiohttp.ClientSession(cookie_jar=api.create_cookie_jar()) as client_session:
         yield client_session
 
 

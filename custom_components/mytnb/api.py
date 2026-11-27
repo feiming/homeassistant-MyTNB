@@ -133,6 +133,19 @@ def maintenance_window_end(now: datetime) -> datetime | None:
     return datetime.combine(end_date, MAINTENANCE_WINDOW_END, tzinfo=TIMEZONE)
 
 
+def create_cookie_jar() -> aiohttp.CookieJar:
+    """The cookie jar the client's session must use.
+
+    By default aiohttp wraps a cookie value in double quotes when sending it
+    back if the value holds characters such as + / = (as base64 tokens do).
+    Browsers send the value as-is, and TNB's smartliving site doesn't
+    recognize the quoted form of its e3AuthToken: it deletes the token and
+    redirects to login (issue #6). Only tokens that happen to contain those
+    characters break, which is why fetches failed only some of the time.
+    """
+    return aiohttp.CookieJar(quote_cookie=False)
+
+
 def extract_smartmeter_path(smartmeter_url: str) -> str:
     """Extract the smartmeter path from the URL pasted by the user."""
     match = _SMARTMETER_PATH_RE.search(smartmeter_url)
@@ -146,6 +159,9 @@ def extract_smartmeter_path(smartmeter_url: str) -> str:
 _TRACE_HEADERS = ("server", "via", "x-cache", "x-azure-ref", "cf-ray", "x-amz-cf-pop")
 
 
+_SAFE_COOKIE_CHARS_RE = re.compile(r"[A-Za-z0-9._-]")
+
+
 def _describe_set_cookie(morsel: Any) -> str:
     """A Set-Cookie as 'name(attrs)': the attributes, never the value.
 
@@ -154,6 +170,10 @@ def _describe_set_cookie(morsel: Any) -> str:
     it back on the next request.
     """
     attrs = [f"len={len(morsel.value)}" if morsel.value else "empty"]
+    # Just which special characters occur, e.g. "+/=", which decides
+    # whether a cookie jar that quotes values would mangle it (issue #6).
+    if special := "".join(sorted(set(_SAFE_COOKIE_CHARS_RE.sub("", morsel.value)))):
+        attrs.append(f"chars={special}")
     for attr in ("path", "domain", "max-age", "expires"):
         if morsel[attr]:
             attrs.append(f"{attr}={morsel[attr]}")
@@ -250,10 +270,8 @@ class MyTNBClient:
         """Fetch usage and cost on a freshly logged-in session.
 
         Every fetch starts with a full login rather than reusing the session
-        from the previous poll (issue #6). Polls are hours apart, so that
-        session has always expired by then. Fetching with it first and only
-        re-logging-in after the rejection left a running integration failing
-        every poll, while a reload (which logs in before fetching) worked.
+        from the previous poll. Polls are hours apart, so that session has
+        always expired by then and a fetch with it would only be bounced.
         Logging in up front sends every poll down the same path as startup.
         """
         await self._relogin()

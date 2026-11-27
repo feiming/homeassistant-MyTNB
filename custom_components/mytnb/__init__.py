@@ -8,7 +8,7 @@ from homeassistant.core import HomeAssistant
 from homeassistant.exceptions import ConfigEntryError
 from homeassistant.helpers.aiohttp_client import async_create_clientsession
 
-from .api import MyTNBClient, MyTNBError
+from .api import MyTNBClient, MyTNBError, create_cookie_jar
 from .const import CONF_SMARTMETER_URL
 from .coordinator import MyTNBCoordinator
 
@@ -22,7 +22,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: MyTNBConfigEntry) -> boo
     # A dedicated (non-shared) session so the portal's cookies stay isolated.
     # HA auto-detaches this session on HA shutdown or when this entry is
     # unloaded/reloaded, so we must not close it ourselves.
-    session = async_create_clientsession(hass)
+    session = async_create_clientsession(hass, cookie_jar=create_cookie_jar())
     try:
         client = MyTNBClient(
             session,

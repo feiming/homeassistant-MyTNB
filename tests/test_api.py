@@ -5,9 +5,11 @@ from __future__ import annotations
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
+import aiohttp
 import pytest
 
 from conftest import (
+    AUTH_TOKEN,
     DASHBOARD_PAGE,
     LOGIN_REDIRECT_JSON,
     SDPUDCID,
@@ -172,8 +174,28 @@ async def test_each_poll_logs_in_fresh(client, fake_tnb):
     assert fake_tnb.commodity_visits == ["usage", "cost", "usage", "cost"]
 
 
-def everything_debug(caplog) -> str:
-    return "\n".join(r.getMessage() for r in caplog.records)
+async def test_auth_token_is_sent_back_unquoted(client, fake_tnb, monkeypatch):
+    """Issue #6: aiohttp's default jar quotes e3AuthToken, so TNB bounces us.
+
+    A token holding + / = (base64) went back as e3AuthToken="...", which
+    TNB doesn't recognize: it deletes the token and redirects to login.
+    """
+    monkeypatch.setattr(api, "_SESSION_LAG_RETRIES", 1)
+    fake_tnb.timeseries = {"usage": [USAGE_OK], "cost": [COST_OK]}
+    # (the client fixture is only requested for pointing the URLs at the fake)
+
+    # aiohttp's default jar: the bug
+    async with aiohttp.ClientSession(cookie_jar=aiohttp.CookieJar()) as session:
+        client = api.MyTNBClient(session, "user@example.com", "secret", SMARTMETER_URL)
+        with pytest.raises(api.MyTNBAuthError):
+            await client.async_get_data(START, END)
+
+    # the jar the integration uses: the fix
+    async with aiohttp.ClientSession(cookie_jar=api.create_cookie_jar()) as session:
+        client = api.MyTNBClient(session, "user@example.com", "secret", SMARTMETER_URL)
+        data = await client.async_get_data(START, END)
+    assert len(data.usage) == 1
+    assert len(data.cost) == 1
 
 
 async def test_rejection_is_logged_with_diagnostics(client, fake_tnb, monkeypatch, caplog):
@@ -198,12 +220,15 @@ async def test_rejection_is_logged_with_diagnostics(client, fake_tnb, monkeypatc
     assert "login #2" in last
     assert "since login" in last
     assert "ASP.NET_SessionId" in last  # cookie names are shown...
-    # ...and Set-Cookie attributes show the timeseries deleting the token
-    assert "set-cookie=ASP.NET_SessionId(empty;path=/;max-age=0" in last
-    assert "set-cookie=ASP.NET_SessionId(len=" in everything_debug(caplog)
+    # ...and Set-Cookie attributes show the commodity page issuing the token,
+    # which special characters it holds, and the timeseries deleting it
+    issued = f"set-cookie=e3AuthToken(len={len(AUTH_TOKEN)};chars=+/=;path=/)"
+    assert issued in last
+    assert "set-cookie=e3AuthToken(empty;path=/;max-age=0" in last
 
     everything = caplog.text
     assert SESSION_COOKIE_VALUE not in everything  # ...but never their values
+    assert AUTH_TOKEN not in everything
     assert "secret" not in everything  # the password
     assert "caNo=" not in everything  # query strings are dropped
 
