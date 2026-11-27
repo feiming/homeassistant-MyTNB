@@ -94,7 +94,11 @@ class FakeTNB:
         entry = self._pop(self.timeseries[metric])
         if isinstance(entry, int):
             return web.Response(status=entry)
-        return web.json_response(entry)
+        response = web.json_response(entry)
+        if entry.get("redirect"):
+            # Like TNB (issue #6): bounce to login and delete the auth cookie.
+            response.del_cookie("ASP.NET_SessionId")
+        return response
 
 
 @pytest.fixture(autouse=True)

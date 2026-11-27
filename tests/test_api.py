@@ -172,6 +172,10 @@ async def test_each_poll_logs_in_fresh(client, fake_tnb):
     assert fake_tnb.commodity_visits == ["usage", "cost", "usage", "cost"]
 
 
+def everything_debug(caplog) -> str:
+    return "\n".join(r.getMessage() for r in caplog.records)
+
+
 async def test_rejection_is_logged_with_diagnostics(client, fake_tnb, monkeypatch, caplog):
     """A rejected session logs why at WARNING, without leaking secrets (issue #6)."""
     monkeypatch.setattr(api, "_SESSION_LAG_RETRIES", 1)
@@ -194,6 +198,9 @@ async def test_rejection_is_logged_with_diagnostics(client, fake_tnb, monkeypatc
     assert "login #2" in last
     assert "since login" in last
     assert "ASP.NET_SessionId" in last  # cookie names are shown...
+    # ...and Set-Cookie attributes show the timeseries deleting the token
+    assert "set-cookie=ASP.NET_SessionId(empty;path=/;max-age=0" in last
+    assert "set-cookie=ASP.NET_SessionId(len=" in everything_debug(caplog)
 
     everything = caplog.text
     assert SESSION_COOKIE_VALUE not in everything  # ...but never their values

@@ -146,6 +146,20 @@ def extract_smartmeter_path(smartmeter_url: str) -> str:
 _TRACE_HEADERS = ("server", "via", "x-cache", "x-azure-ref", "cf-ray", "x-amz-cf-pop")
 
 
+def _describe_set_cookie(morsel: Any) -> str:
+    """A Set-Cookie as 'name(attrs)': the attributes, never the value.
+
+    The value's length (or 'empty') tells a newly issued token apart from
+    the server deleting it, and path/domain show whether our jar will send
+    it back on the next request.
+    """
+    attrs = [f"len={len(morsel.value)}" if morsel.value else "empty"]
+    for attr in ("path", "domain", "max-age", "expires"):
+        if morsel[attr]:
+            attrs.append(f"{attr}={morsel[attr]}")
+    return f"{morsel.key}({';'.join(attrs)})"
+
+
 def _describe_hop(response: aiohttp.ClientResponse) -> str:
     """One hop as 'STATUS host/path', plus cookies set and edge headers.
 
@@ -154,7 +168,9 @@ def _describe_hop(response: aiohttp.ClientResponse) -> str:
     """
     url = response.url
     parts = [f"{response.status} {url.host}{url.path}"]
-    if set_cookies := sorted({c.key for c in response.cookies.values()}):
+    if set_cookies := [
+        _describe_set_cookie(m) for m in sorted(response.cookies.values(), key=lambda m: m.key)
+    ]:
         parts.append(f"set-cookie={','.join(set_cookies)}")
     edge = [f"{h}={response.headers[h]}" for h in _TRACE_HEADERS if h in response.headers]
     if edge:
@@ -544,9 +560,16 @@ class MyTNBClient:
         if _is_login_url(response.url):
             # Served with 200, so the request "succeeds", but the endpoint was
             # not armed: the timeseries request that follows will be bounced.
-            _LOGGER.debug("Commodity page %s landed on a login page: %s", metric, trace)
+            _LOGGER.debug(
+                "Commodity page %s landed on a login page: %s; %s",
+                metric,
+                trace,
+                self._session_state(),
+            )
         else:
-            _LOGGER.debug("Commodity page %s: %s", metric, trace)
+            # The jar right before the timeseries request: shows whether the
+            # auth token the page just issued is there to be sent.
+            _LOGGER.debug("Commodity page %s: %s; %s", metric, trace, self._session_state())
         return trace
 
     @staticmethod
