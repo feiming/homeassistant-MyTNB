@@ -30,6 +30,7 @@ DASHBOARD_PAGE = f'<script>var x = {{"sdpudcid":"{SDPUDCID}"}};</script>'
 SMARTMETER_URL = (
     "https://myaccount.mytnb.com.my/AccountManagement/SmartMeter/Index/TRIL?caNo=TESTCA"
 )
+SESSION_COOKIE_VALUE = "sessioncookievalue123"
 LOGIN_REDIRECT_JSON = {
     "data": [],
     "html": "",
@@ -74,7 +75,9 @@ class FakeTNB:
         return web.Response(text=self.login_body, content_type="text/html")
 
     async def _sso(self, request: web.Request) -> web.Response:
-        return web.Response(text="")
+        response = web.Response(text="")
+        response.set_cookie("ASP.NET_SessionId", SESSION_COOKIE_VALUE)
+        return response
 
     async def _smartmeter(self, request: web.Request) -> web.Response:
         return web.Response(text="")
@@ -98,6 +101,8 @@ class FakeTNB:
 def fast_retries(monkeypatch):
     """Make session-lag retries instant so tests don't sleep."""
     monkeypatch.setattr(api, "_SESSION_LAG_DELAY", 0)
+    monkeypatch.setattr(api, "_REDIRECT_BACKOFF_BASE", 0)
+    monkeypatch.setattr(api, "_RELOGIN_DELAY", 0)
 
 
 @pytest.fixture
@@ -113,7 +118,9 @@ async def fake_tnb():
 
 @pytest.fixture
 async def session():
-    async with aiohttp.ClientSession() as client_session:
+    # unsafe=True: the fake portal runs on 127.0.0.1, and aiohttp's cookie
+    # jar otherwise drops cookies from IP addresses.
+    async with aiohttp.ClientSession(cookie_jar=aiohttp.CookieJar(unsafe=True)) as client_session:
         yield client_session
 
 

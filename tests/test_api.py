@@ -7,7 +7,14 @@ from zoneinfo import ZoneInfo
 
 import pytest
 
-from conftest import DASHBOARD_PAGE, LOGIN_REDIRECT_JSON, SDPUDCID, SMARTMETER_URL, api
+from conftest import (
+    DASHBOARD_PAGE,
+    LOGIN_REDIRECT_JSON,
+    SDPUDCID,
+    SESSION_COOKIE_VALUE,
+    SMARTMETER_URL,
+    api,
+)
 
 START = datetime(2026, 6, 14, tzinfo=api.TIMEZONE)
 END = datetime(2026, 7, 15, tzinfo=api.TIMEZONE)
@@ -131,9 +138,83 @@ async def test_timeseries_redirect_json_is_retried(client, fake_tnb):
     assert fake_tnb.commodity_visits == ["usage", "usage", "cost"]
 
 
+async def test_redirects_are_retried_with_exponential_backoff(client, fake_tnb, monkeypatch):
+    """Issue #6: each retry after a redirect waits twice as long as the last."""
+    monkeypatch.setattr(api, "_REDIRECT_BACKOFF_BASE", 2.0)
+    sleeps: list[float] = []
+
+    async def fake_sleep(seconds: float) -> None:
+        sleeps.append(seconds)
+
+    monkeypatch.setattr(api.asyncio, "sleep", fake_sleep)
+    fake_tnb.timeseries = {
+        "usage": [LOGIN_REDIRECT_JSON] * 4 + [USAGE_OK],
+        "cost": [COST_OK],
+    }
+
+    data = await client.async_get_data(START, END)
+
+    assert sleeps == [2.0, 4.0, 8.0, 16.0]
+    assert len(data.usage) == 1
+    assert len(data.cost) == 1
+    assert fake_tnb.login_count == 1  # recovered within the poll, no re-login
+    assert fake_tnb.commodity_visits == ["usage"] * 5 + ["cost"]
+
+
+async def test_relogin_waits_and_retries_only_the_rejected_metric(
+    client, fake_tnb, monkeypatch
+):
+    """Issue #6: after usage is rejected, wait, log in again and retry just usage.
+
+    Cost was fetched fine on the first login, so it is kept, not fetched again.
+    """
+    monkeypatch.setattr(api, "_REDIRECT_RETRIES", 1)
+    monkeypatch.setattr(api, "_RELOGIN_DELAY", 60.0)
+    sleeps: list[float] = []
+
+    async def fake_sleep(seconds: float) -> None:
+        sleeps.append(seconds)
+
+    monkeypatch.setattr(api.asyncio, "sleep", fake_sleep)
+    fake_tnb.timeseries = {"usage": [LOGIN_REDIRECT_JSON, USAGE_OK], "cost": [COST_OK]}
+
+    data = await client.async_get_data(START, END)
+
+    assert sleeps == [60.0]
+    assert fake_tnb.login_count == 2
+    assert fake_tnb.commodity_visits == ["usage", "cost", "usage"]  # cost not refetched
+    assert len(data.usage) == 1
+    assert len(data.cost) == 1
+
+
+async def test_failed_relogin_keeps_what_was_fetched(client, fake_tnb, monkeypatch):
+    """If logging in again fails, the metric fetched on the first login is kept."""
+    monkeypatch.setattr(api, "_REDIRECT_RETRIES", 1)
+    fake_tnb.timeseries = {"usage": [LOGIN_REDIRECT_JSON], "cost": [COST_OK]}
+    # the first login's dashboard works; the second login's never shows the meter
+    fake_tnb.dashboard_bodies = [DASHBOARD_PAGE, "<html>login redirect</html>"]
+
+    data = await client.async_get_data(START, END)
+
+    assert fake_tnb.login_count == 2
+    assert data.usage == []
+    assert len(data.cost) == 1
+
+
+async def test_everything_rejected_is_an_auth_error(client, fake_tnb, monkeypatch):
+    monkeypatch.setattr(api, "_REDIRECT_RETRIES", 1)
+    fake_tnb.timeseries = {"usage": [LOGIN_REDIRECT_JSON], "cost": [LOGIN_REDIRECT_JSON]}
+
+    with pytest.raises(api.MyTNBAuthError):
+        await client.async_get_data(START, END)
+    assert fake_tnb.login_count == 2
+    # both rejected on the first login, so both retried on the second
+    assert fake_tnb.commodity_visits == ["usage", "cost", "usage", "cost"]
+
+
 async def test_expired_session_triggers_relogin(client, fake_tnb, monkeypatch):
     """If every retry gets the redirect JSON, the client re-logins and recovers."""
-    monkeypatch.setattr(api, "_SESSION_LAG_RETRIES", 1)
+    monkeypatch.setattr(api, "_REDIRECT_RETRIES", 1)
     fake_tnb.timeseries = {
         "usage": [LOGIN_REDIRECT_JSON, USAGE_OK],
         "cost": [COST_OK],
@@ -144,6 +225,82 @@ async def test_expired_session_triggers_relogin(client, fake_tnb, monkeypatch):
     assert fake_tnb.login_count == 2
     assert len(data.usage) == 1
     assert len(data.cost) == 1
+
+
+async def test_each_poll_logs_in_fresh(client, fake_tnb):
+    """A later poll must not reuse the earlier, long-expired session (issue #6).
+
+    Fetching with the stale session first left running installs stuck in a
+    login redirect loop while a reload (fresh login) worked, so every poll
+    logs in before its first request, exactly like startup.
+    """
+    fake_tnb.timeseries = {"usage": [USAGE_OK], "cost": [COST_OK]}
+
+    await client.async_get_data(START, END)
+    data = await client.async_get_data(START, END)
+
+    assert fake_tnb.login_count == 2
+    assert len(data.usage) == 1
+    assert len(data.cost) == 1
+    # one armed request per metric per poll: no doomed attempt on a stale session
+    assert fake_tnb.commodity_visits == ["usage", "cost", "usage", "cost"]
+
+
+async def test_rejection_is_logged_with_diagnostics(client, fake_tnb, monkeypatch, caplog):
+    """A rejected session logs why at WARNING, without leaking secrets (issue #6)."""
+    monkeypatch.setattr(api, "_REDIRECT_RETRIES", 1)
+    fake_tnb.timeseries = {
+        "usage": [{**LOGIN_REDIRECT_JSON, "errorMessage": "Session timed out"}],
+        "cost": [COST_OK],
+    }
+
+    with caplog.at_level("DEBUG", logger="mytnb_api"):
+        data = await client.async_get_data(START, END)
+    assert data.usage == [] and len(data.cost) == 1  # cost kept, usage given up
+
+    warnings = [
+        r.getMessage()
+        for r in caplog.records
+        if r.levelname == "WARNING" and r.getMessage().startswith("MyTNB usage timeseries")
+    ]
+    # one per login: the up-front one and the retry
+    assert len(warnings) == 2
+    last = warnings[-1]
+    assert "redirectTo='/login'" in last
+    assert "errorMessage='Session timed out'" in last
+    assert "/my_energy_request/timeseries" in last
+    assert "/commodity/electric/usage" in last
+    assert "login #2" in last
+    assert "since login" in last
+    assert "ASP.NET_SessionId" in last  # cookie names are shown...
+
+    everything = caplog.text
+    assert SESSION_COOKIE_VALUE not in everything  # ...but never their values
+    assert "secret" not in everything  # the password
+    assert "caNo=" not in everything  # query strings are dropped
+
+
+def test_safe_error_strips_query_strings():
+    """aiohttp puts the full URL, caNo/sdpudcid included, in its errors."""
+    err = Exception(
+        "500, message='Internal Server Error', url='https://myaccount.mytnb.com.my"
+        "/AccountManagement/SmartMeter/Index/TRIL?caNo=220012345678'"
+    )
+    safe = api._safe_error(err)
+    assert "220012345678" not in safe
+    assert "myaccount.mytnb.com.my/AccountManagement/SmartMeter/Index/TRIL'" in safe
+
+
+async def test_http_errors_do_not_log_meter_id(client, fake_tnb, caplog):
+    """A 500 from TNB is logged without the sdpudcid from the request URL."""
+    fake_tnb.timeseries = {"usage": [USAGE_OK], "cost": [500]}
+
+    with caplog.at_level("WARNING", logger="mytnb_api"):
+        await client.async_get_data(START, END)
+
+    assert "Fetching cost failed" in caplog.text
+    assert "500" in caplog.text
+    assert SDPUDCID not in caplog.text
 
 
 async def test_one_metric_failing_is_tolerated(client, fake_tnb):
@@ -164,8 +321,8 @@ async def test_both_metrics_failing_raises(client, fake_tnb):
 
 
 async def test_forbidden_timeseries_is_auth_error(client, fake_tnb):
-    """401/403 must not be swallowed by the partial-failure tolerance."""
-    fake_tnb.timeseries = {"usage": [403], "cost": [COST_OK]}
+    """401/403 on every metric, even after re-login, surfaces as an auth error."""
+    fake_tnb.timeseries = {"usage": [403], "cost": [403]}
 
     with pytest.raises(api.MyTNBAuthError):
         # relogin is attempted once, then the auth error surfaces
@@ -175,8 +332,8 @@ async def test_forbidden_timeseries_is_auth_error(client, fake_tnb):
 
 async def test_timeseries_redirect_loop_is_not_credentials_error(client, fake_tnb, monkeypatch):
     """A persistent login redirect on timeseries is a session problem, not a bad password."""
-    monkeypatch.setattr(api, "_SESSION_LAG_RETRIES", 1)
-    fake_tnb.timeseries = {"usage": [LOGIN_REDIRECT_JSON], "cost": [COST_OK]}
+    monkeypatch.setattr(api, "_REDIRECT_RETRIES", 1)
+    fake_tnb.timeseries = {"usage": [LOGIN_REDIRECT_JSON], "cost": [LOGIN_REDIRECT_JSON]}
 
     with pytest.raises(api.MyTNBAuthError) as exc_info:
         await client.async_get_data(START, END)
