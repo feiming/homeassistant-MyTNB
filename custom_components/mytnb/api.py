@@ -81,8 +81,9 @@ _REDIRECT_BACKOFF_BASE = 2.0
 
 
 # After the retries above, wait this long before logging in again and
-# retrying just the rejected metrics: TNB's bad stretches can outlast them.
-_RELOGIN_DELAY = 60.0
+# retrying just the rejected metrics: TNB's bad stretches can last minutes,
+# outlasting the retries (issue #6). The poll stays in progress meanwhile.
+_RELOGIN_DELAY = 600.0
 
 # (metric, granularity). Cost does not support sub-daily granularity.
 _METRICS: tuple[tuple[str, str | None], ...] = (("usage", "HOUR"), ("cost", None))
