@@ -71,6 +71,14 @@ _REQUEST_DATE_FORMAT = "%Y-%m-%d+00:00"
 _SESSION_LAG_RETRIES = 3
 _SESSION_LAG_DELAY = 2.0
 
+# Pace requests like a person browsing the portal rather than firing them
+# back to back: TNB rejects valid sessions in stretches (issue #6), and a
+# burst of rapid requests is what a person never produces. A browser loads
+# the commodity page, renders it, then its script requests the timeseries;
+# moving on to the next chart takes a person a while longer.
+_PAGE_VIEW_DELAY = 3.0
+_BETWEEN_METRICS_DELAY = 15.0
+
 # TNB takes the portal down for scheduled maintenance from 23:30 to 00:30
 # Malaysia time every night and rejects sessions meanwhile (issue #2), so
 # callers should avoid fetching inside this window. It is padded by five
@@ -435,6 +443,7 @@ class MyTNBClient:
 
         # Cost does not support sub-daily granularity.
         usage = await fetch("usage", "HOUR")
+        await asyncio.sleep(_BETWEEN_METRICS_DELAY)
         cost = await fetch("cost", None)
 
         if len(errors) == 2:
@@ -474,6 +483,7 @@ class MyTNBClient:
         for attempt in range(_SESSION_LAG_RETRIES):
             try:
                 commodity_trace = await self._visit_commodity_page(metric)
+                await asyncio.sleep(_PAGE_VIEW_DELAY)
             except MyTNBAuthError as err:
                 # Redirect loops on the commodity page are transient during
                 # session propagation, same as the redirect-JSON below.

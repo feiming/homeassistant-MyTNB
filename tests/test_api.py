@@ -279,6 +279,24 @@ async def test_one_metric_bounced_to_login_keeps_the_other(client, fake_tnb, mon
     assert fake_tnb.login_count == 1
 
 
+async def test_requests_are_paced_like_a_person(client, fake_tnb, monkeypatch):
+    """A pause after each commodity page and between the two charts (issue #6)."""
+    monkeypatch.setattr(api, "_PAGE_VIEW_DELAY", 3.0)
+    monkeypatch.setattr(api, "_BETWEEN_METRICS_DELAY", 15.0)
+    sleeps: list[float] = []
+
+    async def fake_sleep(seconds: float) -> None:
+        sleeps.append(seconds)
+
+    monkeypatch.setattr(api.asyncio, "sleep", fake_sleep)
+    fake_tnb.timeseries = {"usage": [USAGE_OK], "cost": [COST_OK]}
+
+    await client.async_get_data(START, END)
+
+    # usage page, pause before the next chart, cost page
+    assert sleeps == [3.0, 15.0, 3.0]
+
+
 async def test_one_metric_failing_is_tolerated(client, fake_tnb):
     """A transient 500 on one metric returns empty for it, keeps the other."""
     fake_tnb.timeseries = {"usage": [USAGE_OK], "cost": [500]}
