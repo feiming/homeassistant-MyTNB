@@ -216,6 +216,46 @@ async def test_configured_interval_is_respected(coordinator_module, fresh_data, 
     assert coord.update_interval == timedelta(hours=12)
 
 
+async def test_failed_poll_retries_soon_with_backoff(coordinator, coordinator_module, set_now):
+    """Issue #6: retry a rejected poll after minutes, not the 6-hour interval."""
+    set_now(2026, 11, 16, 14, 0)
+    get_data = coordinator.client.async_get_data
+    get_data.side_effect = coordinator_module.MyTNBAuthError("redirect")
+
+    intervals = []
+    for _ in range(7):
+        with pytest.raises(_FakeUpdateFailed):
+            await coordinator._async_update_data()
+        intervals.append(coordinator.update_interval)
+    assert intervals == [
+        timedelta(minutes=10),
+        timedelta(minutes=20),
+        timedelta(minutes=40),
+        timedelta(minutes=80),
+        timedelta(minutes=160),
+        timedelta(minutes=320),
+        timedelta(hours=6),  # capped at the poll interval
+    ]
+
+    # a success goes back to the normal interval and resets the backoff
+    get_data.side_effect = None
+    await coordinator._async_update_data()
+    assert coordinator.update_interval == timedelta(hours=6)
+    get_data.side_effect = coordinator_module.MyTNBConnectionError("timeout")
+    with pytest.raises(_FakeUpdateFailed):
+        await coordinator._async_update_data()
+    assert coordinator.update_interval == timedelta(minutes=10)
+
+
+async def test_no_smart_meter_does_not_retry_early(coordinator, coordinator_module, set_now):
+    """A missing meter won't heal in minutes; keep the normal interval."""
+    set_now(2026, 11, 16, 14, 0)
+    coordinator.client.async_get_data.side_effect = coordinator_module.MyTNBNoSmartMeterError("x")
+    with pytest.raises(_FakeUpdateFailed):
+        await coordinator._async_update_data()
+    assert coordinator.update_interval == timedelta(hours=6)
+
+
 async def test_session_rejection_outside_window_retries_without_reauth(
     coordinator, coordinator_module, set_now
 ):

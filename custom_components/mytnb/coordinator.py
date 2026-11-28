@@ -39,9 +39,14 @@ from .const import (
     DEFAULT_UPDATE_INTERVAL_HOURS,
     DOMAIN,
     FETCH_WINDOW,
+    RETRY_INTERVAL,
 )
 
 _LOGGER = logging.getLogger(__name__)
+
+
+def _minutes(delta: timedelta) -> str:
+    return f"{round(delta.total_seconds() / 60)} min"
 
 
 class MyTNBCoordinator(DataUpdateCoordinator[SmartMeterData]):
@@ -61,6 +66,24 @@ class MyTNBCoordinator(DataUpdateCoordinator[SmartMeterData]):
         )
         self.client = client
         self._poll_interval = timedelta(hours=hours)
+        self._consecutive_failures = 0
+
+    def _schedule_retry(self) -> timedelta:
+        """Poll again soon after a transient failure, backing off each time.
+
+        TNB rejects valid sessions in stretches lasting minutes (issue #6).
+        Retries within one poll are seconds apart, so they land in the same
+        stretch. Waiting the full poll interval (6 hours by default) left a
+        running integration stale for hours, which is why a reload, which
+        simply tried again later, seemed to fix it. Retry after 10 minutes,
+        doubling each time, capped at the poll interval.
+        """
+        self._consecutive_failures += 1
+        retry_in = min(
+            RETRY_INTERVAL * 2 ** (self._consecutive_failures - 1), self._poll_interval
+        )
+        self.update_interval = retry_in
+        return retry_in
 
     async def _async_update_data(self) -> SmartMeterData:
         """Fetch data and import it into long-term statistics."""
@@ -82,15 +105,22 @@ class MyTNBCoordinator(DataUpdateCoordinator[SmartMeterData]):
         except MyTNBCredentialsError as err:
             raise ConfigEntryAuthFailed(f"Authentication with MyTNB failed: {err}") from err
         except MyTNBAuthError as err:
-            # TNB rejects sessions for a while around midnight each night, so
-            # even a freshly logged-in session keeps being redirected to the
-            # login page (issue #2). The password is fine, so retry on the next
-            # poll instead of stopping updates until the user reauthenticates.
-            raise UpdateFailed(f"MyTNB session rejected, will retry: {err}") from err
+            # TNB rejects valid sessions for a while around midnight each night
+            # (issue #2) and in stretches at other times (issue #6). The
+            # password is fine, so retry soon instead of stopping updates
+            # until the user reauthenticates.
+            retry_in = self._schedule_retry()
+            raise UpdateFailed(
+                f"MyTNB session rejected, will retry in {_minutes(retry_in)}: {err}"
+            ) from err
         except MyTNBNoSmartMeterError as err:
             raise UpdateFailed(f"No smart meter found on this MyTNB account: {err}") from err
         except MyTNBConnectionError as err:
-            raise UpdateFailed(f"Could not fetch data from MyTNB: {err}") from err
+            retry_in = self._schedule_retry()
+            raise UpdateFailed(
+                f"Could not fetch data from MyTNB, will retry in {_minutes(retry_in)}: {err}"
+            ) from err
+        self._consecutive_failures = 0
 
         await self._async_insert_statistics("usage", data.usage, UnitOfEnergy.KILO_WATT_HOUR)
         await self._async_insert_statistics("cost", data.cost, CURRENCY_MYR)

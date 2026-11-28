@@ -16,4 +16,8 @@ DEFAULT_UPDATE_INTERVAL_HOURS = 6
 # this only needs to comfortably cover TNB's ~2-day data publication lag.
 FETCH_WINDOW = timedelta(days=30)
 
+# First retry after a failed poll; doubles on each further failure, up to the
+# poll interval. TNB's rejections come in stretches of minutes (issue #6).
+RETRY_INTERVAL = timedelta(minutes=10)
+
 CURRENCY_MYR = "MYR"
