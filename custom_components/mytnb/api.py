@@ -13,6 +13,12 @@ would issue them, and has two quirks this client hides from callers:
   so requests made right after login can transiently get the same
   login-redirect response. Such responses are retried before being
   treated as an expired session.
+
+The latest bill comes from the myaccount portal rather than smartliving:
+the dashboard's "View Bill" button carries an encrypted account token,
+which InitProtectID exchanges for the billingNo that PrintPDF2 serves the
+PDF for. The PDF is parsed for the NEM balance, account summary and meter
+readings, then discarded.
 """
 
 from __future__ import annotations
@@ -22,12 +28,13 @@ import logging
 import re
 from collections.abc import Sequence
 from dataclasses import dataclass
-from datetime import datetime, time, timedelta
+from datetime import date, datetime, time, timedelta
 from time import monotonic
 from typing import Any
 from zoneinfo import ZoneInfo
 
 import aiohttp
+from yarl import URL
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -60,6 +67,7 @@ _HTML_HEADERS = {
 _SMARTMETER_PATH_RE = re.compile(r"/AccountManagement/SmartMeter/Index/TRIL\?caNo=[^\"\s]+")
 _FORM_FIELD_RE = re.compile(r'name="([^"]+)" value="([^"]*)"')
 _SDPUDCID_RE = re.compile(r'"sdpudcid":"(\d+)"')
+_BILL_TOKEN_RE = re.compile(r"PrintPDF\(\s*'([0-9A-Fa-f]+)'\s*\)")
 # Account-level JSON embedded in the dashboard of any logged-in account,
 # with or without a smart meter. Login/redirect pages served while a session
 # is still propagating don't carry it, so a dashboard that has this but no
@@ -85,6 +93,10 @@ _REDIRECT_BACKOFF_BASE = 2.0
 # outlasting the retries (issue #6). The poll stays in progress meanwhile.
 _RELOGIN_DELAY = 600.0
 
+# A session this recent (seconds since login) is reused for the bill instead
+# of logging in again: a poll fetching the bill right after the smart meter.
+_SESSION_REUSE_SECONDS = 300
+
 # (metric, granularity). Cost does not support sub-daily granularity.
 _METRICS: tuple[tuple[str, str | None], ...] = (("usage", "HOUR"), ("cost", None))
 
@@ -100,6 +112,41 @@ def _redirect_backoff(attempt: int) -> float:
 # portal the instant it comes back.
 MAINTENANCE_WINDOW_START = time(23, 25)
 MAINTENANCE_WINDOW_END = time(0, 35)
+
+
+# Account dashboard paths, joined to _ACCOUNT_BASE at request time.
+_ACCOUNT_DASHBOARD_PATH = "/AccountManagement/IndividualDashboard"
+_INIT_PROTECT_PATH = "/AccountManagement/ViewAccountProfile/InitProtectID"
+_PRINT_PDF_PATH = "/AccountManagement/ViewAccountProfile/PrintPDF2"
+
+# Bill PDF text patterns. Page 1's summary box extracts as one item per line:
+#   Baki NEM / 970kWh / Tarikh Luput / Baki NEM / 31.12.2026
+#   Baki Terdahulu -RM262.77 / Caj Semasa NEM RM2.74 / Pelarasan Penggenapan RM0.01
+#   Baki NEM Terkumpul RM0.00 / Baki NEM Dibawa Ke Hadapan / - Luput pada 31.12.2026 / RM0.00
+_RM = r"([-−]?\s*RM\s*[-−]?[\d,]+\.\d{2})"
+_NEM_BALANCE_RE = re.compile(r"Baki NEM\s*\n\s*([\d,]+(?:\.\d+)?)\s*kWh")
+_NEM_EXPIRY_RE = re.compile(r"Luput pada\s*(\d{2}\.\d{2}\.\d{4})")
+_NEM_EXPIRY_FALLBACK_RE = re.compile(r"Tarikh Luput[\s\S]{0,200}?(\d{2}\.\d{2}\.\d{4})")
+# The address block: "TARIKH BIL / 02.11.2026 / TEMPOH BIL / 01.10.2026 - 31.10.2026".
+_BILL_DATE_RE = re.compile(r"TARIKH BIL\s*(\d{2}\.\d{2}\.\d{4})", re.IGNORECASE)
+_SUMMARY_RES = {
+    "previous_balance": re.compile(r"Baki Terdahulu\s*" + _RM),
+    "current_nem_charge": re.compile(r"Caj Semasa NEM\s*" + _RM),
+    "rounding_adjustment": re.compile(r"Pelarasan Penggenapan\s*" + _RM),
+    "nem_accumulated_balance": re.compile(r"Baki NEM Terkumpul\s*" + _RM),
+    # The amount follows the "- Luput pada dd.mm.yyyy" line.
+    "nem_balance_carried_forward": re.compile(
+        r"Baki NEM Dibawa Ke Hadapan[\s\S]{0,80}?" + _RM
+    ),
+}
+# Page 3 "Maklumat Meter": M <meter no> <previous> <current> <usage> <unit> [(E)|(I)]
+_METER_RE = re.compile(
+    r"^M\s+(\S+)\s+([\d,]+)\s+([\d,]+)\s+([\d,]+)\s+(kWh|kW|kVARh)\b[ \t]*(?:\((\w)\))?",
+    re.M,
+)
+# (I) is energy imported from the grid (it equals the billed usage); (E) is
+# solar energy exported to it.
+_METER_DIRECTIONS = {"E": "export", "I": "import"}
 
 
 class MyTNBError(Exception):
@@ -141,6 +188,115 @@ class SmartMeterData:
 
     usage: list[EnergyPoint]
     cost: list[EnergyPoint]
+    bill: BillData | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class MeterReading:
+    """One register of the meter, as printed on the bill."""
+
+    meter_no: str
+    previous: float
+    current: float
+    usage: float
+    unit: str
+    direction: str | None  # "import", "export" or None (e.g. kW demand)
+
+
+@dataclass(frozen=True, slots=True)
+class BillData:
+    """Values extracted from the latest bill PDF. Amounts are in RM."""
+
+    bill_date: date | None = None
+    nem_balance_kwh: float | None = None
+    nem_expiry: date | None = None
+    previous_balance: float | None = None
+    current_nem_charge: float | None = None
+    rounding_adjustment: float | None = None
+    nem_accumulated_balance: float | None = None
+    nem_balance_carried_forward: float | None = None
+    meters: tuple[MeterReading, ...] = ()
+
+    def meter(self, unit: str, direction: str | None = None) -> MeterReading | None:
+        """First meter register with this unit (and direction, if given)."""
+        for reading in self.meters:
+            if reading.unit == unit and (direction is None or reading.direction == direction):
+                return reading
+        return None
+
+
+def _parse_rm(value: str) -> float:
+    """'-RM262.77' / '−260.02' / 'RM0.01' -> float."""
+    amount = float(re.sub(r"[^\d.]", "", value))
+    return -amount if ("-" in value or "−" in value) else amount
+
+
+def _parse_number(value: str) -> float:
+    return float(value.replace(",", ""))
+
+
+def _parse_date(value: str) -> date | None:
+    """'31.12.2026' -> date; None if it isn't a real date."""
+    try:
+        return datetime.strptime(value, "%d.%m.%Y").date()
+    except ValueError:
+        return None
+
+
+def parse_bill_text(pages: list[str]) -> BillData:
+    """Extract bill values from the text of each PDF page."""
+    page1 = pages[0] if pages else ""
+
+    nem_balance = None
+    if match := _NEM_BALANCE_RE.search(page1):
+        nem_balance = _parse_number(match.group(1))
+
+    nem_expiry = None
+    if match := (_NEM_EXPIRY_RE.search(page1) or _NEM_EXPIRY_FALLBACK_RE.search(page1)):
+        nem_expiry = _parse_date(match.group(1))
+
+    bill_date = None
+    if match := _BILL_DATE_RE.search(page1):
+        bill_date = _parse_date(match.group(1))
+
+    summary = {
+        key: _parse_rm(match.group(1)) if (match := pattern.search(page1)) else None
+        for key, pattern in _SUMMARY_RES.items()
+    }
+
+    meters = tuple(
+        MeterReading(
+            meter_no=match.group(1),
+            previous=_parse_number(match.group(2)),
+            current=_parse_number(match.group(3)),
+            usage=_parse_number(match.group(4)),
+            unit=match.group(5),
+            direction=_METER_DIRECTIONS.get(match.group(6) or ""),
+        )
+        for match in _METER_RE.finditer("\n".join(pages))
+    )
+
+    return BillData(
+        bill_date=bill_date,
+        nem_balance_kwh=nem_balance,
+        nem_expiry=nem_expiry,
+        meters=meters,
+        **summary,
+    )
+
+
+def parse_bill_pdf(pdf: bytes) -> BillData:
+    """Parse a bill PDF. CPU-bound: run it in an executor."""
+    from io import BytesIO
+
+    from pypdf import PdfReader  # imported lazily; only needed off the event loop
+
+    try:
+        reader = PdfReader(BytesIO(pdf))
+        pages = [page.extract_text() or "" for page in reader.pages]
+    except Exception as err:  # pypdf raises a variety of errors on bad input
+        raise MyTNBError(f"Could not read bill PDF: {err}") from err
+    return parse_bill_text(pages)
 
 
 def maintenance_window_end(now: datetime) -> datetime | None:
@@ -305,6 +461,78 @@ class MyTNBClient:
         for metric, err in errors.items():
             _LOGGER.warning("Fetching %s failed: %s", metric, err)
         return SmartMeterData(usage=results.get("usage", []), cost=results.get("cost", []))
+
+    async def async_get_bill(self) -> BillData:
+        """Download and parse the latest bill.
+
+        Usually runs right after a poll's smart meter fetch, so that poll's
+        fresh session is reused. Otherwise (the scheduled bill check between
+        polls) the session is hours old and has always expired, so log in
+        first, as every poll does (issue #6). If the bill is still rejected,
+        log in again once and retry.
+        """
+        if (
+            self.sdpudcid is None
+            or self._login_at is None
+            or monotonic() - self._login_at > _SESSION_REUSE_SECONDS
+        ):
+            await self._relogin()
+        try:
+            pdf = await self._fetch_bill_pdf()
+        except MyTNBAuthError as err:
+            _LOGGER.debug("Session rejected while fetching bill (%s); logging in again", err)
+            await self._relogin()
+            pdf = await self._fetch_bill_pdf()
+        return await asyncio.get_running_loop().run_in_executor(None, parse_bill_pdf, pdf)
+
+    async def _fetch_bill_pdf(self) -> bytes:
+        """Dashboard token -> InitProtectID -> PrintPDF2, as the page's JS does."""
+        dashboard_url = f"{_ACCOUNT_BASE}{_ACCOUNT_DASHBOARD_PATH}"
+        try:
+            async with self._session.get(dashboard_url) as response:
+                # An expired session is redirected to /Home/SessionExpired.
+                if response.status in (401, 403) or "SessionExpired" in response.url.path:
+                    raise MyTNBAuthError(
+                        f"Account dashboard rejected (status {response.status}, {response.url.path})"
+                    )
+                response.raise_for_status()
+                html = await response.text()
+
+            tokens = list(dict.fromkeys(_BILL_TOKEN_RE.findall(html)))
+            if not tokens:
+                raise MyTNBError("No 'View Bill' button found on the account dashboard")
+            if len(tokens) > 1:
+                _LOGGER.debug("%d bills on the dashboard; using the first", len(tokens))
+
+            # PrintPDF(billingNo) posts "<token>,<IsOwnedAccount>".
+            async with self._session.post(
+                f"{_ACCOUNT_BASE}{_INIT_PROTECT_PATH}",
+                data={"selectedAccountID": f"{tokens[0]},True"},
+                headers={"X-Requested-With": "XMLHttpRequest", "Referer": dashboard_url},
+            ) as response:
+                if response.status in (401, 403):
+                    raise MyTNBAuthError(f"InitProtectID rejected with status {response.status}")
+                response.raise_for_status()
+                billing_no = (await response.text()).strip().strip('"')
+            if not billing_no:
+                raise MyTNBConnectionError("InitProtectID returned an empty billingNo")
+
+            # The page inserts billingNo into the URL unencoded ('+' and '/'
+            # included); the server expects exactly that.
+            pdf_url = URL(
+                f"{_ACCOUNT_BASE}{_PRINT_PDF_PATH}?billingNo={billing_no}", encoded=True
+            )
+            async with self._session.get(pdf_url, headers={"Referer": dashboard_url}) as response:
+                response.raise_for_status()
+                pdf = await response.read()
+        except aiohttp.TooManyRedirects as err:
+            raise MyTNBAuthError("Account dashboard stuck in a redirect loop") from err
+        except aiohttp.ClientError as err:
+            raise MyTNBConnectionError(f"Bill request failed: {err}") from err
+
+        if not pdf.startswith(b"%PDF"):
+            raise MyTNBConnectionError("PrintPDF2 did not return a PDF")
+        return pdf
 
     async def _relogin(self) -> None:
         async with self._auth_lock:

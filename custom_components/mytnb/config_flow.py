@@ -16,7 +16,13 @@ from homeassistant.config_entries import (
 )
 from homeassistant.const import CONF_PASSWORD, CONF_USERNAME
 from homeassistant.helpers.aiohttp_client import async_create_clientsession
-from homeassistant.helpers.selector import NumberSelector, NumberSelectorConfig
+from homeassistant.helpers.selector import (
+    BooleanSelector,
+    NumberSelector,
+    NumberSelectorConfig,
+    NumberSelectorMode,
+    TimeSelector,
+)
 
 from .api import (
     MyTNBAuthError,
@@ -27,8 +33,14 @@ from .api import (
     MyTNBNoSmartMeterError,
 )
 from .const import (
+    CONF_BILL_ENABLED,
+    CONF_BILL_DAY,
+    CONF_BILL_TIME,
     CONF_SMARTMETER_URL,
     CONF_UPDATE_INTERVAL_HOURS,
+    DEFAULT_BILL_ENABLED,
+    DEFAULT_BILL_DAY,
+    DEFAULT_BILL_TIME,
     DEFAULT_UPDATE_INTERVAL_HOURS,
     DOMAIN,
 )
@@ -138,18 +150,31 @@ class MyTNBOptionsFlow(OptionsFlow):
     async def async_step_init(
         self, user_input: dict[str, Any] | None = None
     ) -> ConfigFlowResult:
-        """Let the user adjust the polling interval."""
+        """Let the user adjust the polling interval and the bill schedule."""
         if user_input is not None:
             return self.async_create_entry(data=user_input)
 
-        current = self.config_entry.options.get(
-            CONF_UPDATE_INTERVAL_HOURS, DEFAULT_UPDATE_INTERVAL_HOURS
-        )
+        options = self.config_entry.options
         schema = vol.Schema(
             {
-                vol.Required(CONF_UPDATE_INTERVAL_HOURS, default=current): NumberSelector(
-                    NumberSelectorConfig(min=1, max=24, step=1)
-                )
+                vol.Required(
+                    CONF_UPDATE_INTERVAL_HOURS,
+                    default=options.get(CONF_UPDATE_INTERVAL_HOURS, DEFAULT_UPDATE_INTERVAL_HOURS),
+                ): NumberSelector(NumberSelectorConfig(min=1, max=24, step=1)),
+                vol.Required(
+                    CONF_BILL_ENABLED,
+                    default=options.get(CONF_BILL_ENABLED, DEFAULT_BILL_ENABLED),
+                ): BooleanSelector(),
+                vol.Required(
+                    CONF_BILL_DAY,
+                    default=options.get(CONF_BILL_DAY, DEFAULT_BILL_DAY),
+                ): NumberSelector(
+                    NumberSelectorConfig(min=1, max=31, step=1, mode=NumberSelectorMode.BOX)
+                ),
+                vol.Required(
+                    CONF_BILL_TIME,
+                    default=options.get(CONF_BILL_TIME, DEFAULT_BILL_TIME),
+                ): TimeSelector(),
             }
         )
         return self.async_show_form(step_id="init", data_schema=schema)
