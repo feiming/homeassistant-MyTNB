@@ -101,6 +101,7 @@ class FakeTNB:
 def fast_retries(monkeypatch):
     """Make session-lag retries instant so tests don't sleep."""
     monkeypatch.setattr(api, "_SESSION_LAG_DELAY", 0)
+    monkeypatch.setattr(api, "_REDIRECT_BACKOFF_BASE", 0)
 
 
 @pytest.fixture

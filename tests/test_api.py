@@ -138,9 +138,32 @@ async def test_timeseries_redirect_json_is_retried(client, fake_tnb):
     assert fake_tnb.commodity_visits == ["usage", "usage", "cost"]
 
 
+async def test_redirects_are_retried_with_exponential_backoff(client, fake_tnb, monkeypatch):
+    """Issue #6: each retry after a redirect waits twice as long as the last."""
+    monkeypatch.setattr(api, "_REDIRECT_BACKOFF_BASE", 2.0)
+    sleeps: list[float] = []
+
+    async def fake_sleep(seconds: float) -> None:
+        sleeps.append(seconds)
+
+    monkeypatch.setattr(api.asyncio, "sleep", fake_sleep)
+    fake_tnb.timeseries = {
+        "usage": [LOGIN_REDIRECT_JSON] * 4 + [USAGE_OK],
+        "cost": [COST_OK],
+    }
+
+    data = await client.async_get_data(START, END)
+
+    assert sleeps == [2.0, 4.0, 8.0, 16.0]
+    assert len(data.usage) == 1
+    assert len(data.cost) == 1
+    assert fake_tnb.login_count == 1  # recovered within the poll, no re-login
+    assert fake_tnb.commodity_visits == ["usage"] * 5 + ["cost"]
+
+
 async def test_expired_session_triggers_relogin(client, fake_tnb, monkeypatch):
     """If every retry gets the redirect JSON, the client re-logins and recovers."""
-    monkeypatch.setattr(api, "_SESSION_LAG_RETRIES", 1)
+    monkeypatch.setattr(api, "_REDIRECT_RETRIES", 1)
     fake_tnb.timeseries = {
         "usage": [LOGIN_REDIRECT_JSON, USAGE_OK],
         "cost": [COST_OK],
@@ -174,7 +197,7 @@ async def test_each_poll_logs_in_fresh(client, fake_tnb):
 
 async def test_rejection_is_logged_with_diagnostics(client, fake_tnb, monkeypatch, caplog):
     """A rejected session logs why at WARNING, without leaking secrets (issue #6)."""
-    monkeypatch.setattr(api, "_SESSION_LAG_RETRIES", 1)
+    monkeypatch.setattr(api, "_REDIRECT_RETRIES", 1)
     fake_tnb.timeseries = {
         "usage": [{**LOGIN_REDIRECT_JSON, "errorMessage": "Session timed out"}],
         "cost": [COST_OK],
@@ -253,7 +276,7 @@ async def test_forbidden_timeseries_is_auth_error(client, fake_tnb):
 
 async def test_timeseries_redirect_loop_is_not_credentials_error(client, fake_tnb, monkeypatch):
     """A persistent login redirect on timeseries is a session problem, not a bad password."""
-    monkeypatch.setattr(api, "_SESSION_LAG_RETRIES", 1)
+    monkeypatch.setattr(api, "_REDIRECT_RETRIES", 1)
     fake_tnb.timeseries = {"usage": [LOGIN_REDIRECT_JSON], "cost": [COST_OK]}
 
     with pytest.raises(api.MyTNBAuthError) as exc_info:

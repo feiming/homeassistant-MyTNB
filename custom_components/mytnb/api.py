@@ -71,6 +71,19 @@ _REQUEST_DATE_FORMAT = "%Y-%m-%d+00:00"
 _SESSION_LAG_RETRIES = 3
 _SESSION_LAG_DELAY = 2.0
 
+# TNB's timeseries endpoint rejects valid sessions some of the time,
+# redirecting to login (issue #6): about 2 in 5 requests in bad stretches,
+# which last from seconds to minutes. Retrying at once tends to land in the
+# same stretch, so each retry after a redirect waits twice as long as the
+# last: 2, 4, 8 and 16 seconds, at most 30 s per metric.
+_REDIRECT_RETRIES = 5
+_REDIRECT_BACKOFF_BASE = 2.0
+
+
+def _redirect_backoff(attempt: int) -> float:
+    """Seconds to wait after the redirect on attempt `attempt` (0-based)."""
+    return _REDIRECT_BACKOFF_BASE * 2**attempt
+
 # TNB takes the portal down for scheduled maintenance from 23:30 to 00:30
 # Malaysia time every night and rejects sessions meanwhile (issue #2), so
 # callers should avoid fetching inside this window. It is padded by five
@@ -423,20 +436,20 @@ class MyTNBClient:
 
         commodity_trace = timeseries_trace = "(no response)"
         redirect_info = ""
-        for attempt in range(_SESSION_LAG_RETRIES):
+        for attempt in range(_REDIRECT_RETRIES):
             try:
                 commodity_trace = await self._visit_commodity_page(metric)
             except MyTNBAuthError as err:
                 # Redirect loops on the commodity page are transient during
                 # session propagation, same as the redirect-JSON below.
-                if attempt < _SESSION_LAG_RETRIES - 1:
-                    await asyncio.sleep(_SESSION_LAG_DELAY)
+                if attempt < _REDIRECT_RETRIES - 1:
+                    await asyncio.sleep(_redirect_backoff(attempt))
                     continue
                 _LOGGER.warning(
                     "MyTNB %s commodity page kept rejecting the session after %d attempts: "
                     "%s; %s",
                     metric,
-                    _SESSION_LAG_RETRIES,
+                    _REDIRECT_RETRIES,
                     err.trace or "(no trace)",
                     self._session_state(),
                 )
@@ -496,27 +509,27 @@ class MyTNBClient:
                 "commodity page: %s; %s",
                 metric,
                 attempt + 1,
-                _SESSION_LAG_RETRIES,
+                _REDIRECT_RETRIES,
                 redirect_info,
                 timeseries_trace,
                 commodity_trace,
                 self._session_state(),
             )
-            if attempt < _SESSION_LAG_RETRIES - 1:
-                await asyncio.sleep(_SESSION_LAG_DELAY)
+            if attempt < _REDIRECT_RETRIES - 1:
+                await asyncio.sleep(_redirect_backoff(attempt))
 
         _LOGGER.warning(
             "MyTNB %s timeseries kept redirecting to login after %d attempts: %s; "
             "timeseries: %s; commodity page: %s; %s",
             metric,
-            _SESSION_LAG_RETRIES,
+            _REDIRECT_RETRIES,
             redirect_info,
             timeseries_trace,
             commodity_trace,
             self._session_state(),
         )
         raise MyTNBAuthError(
-            f"Timeseries {metric} kept redirecting to login after {_SESSION_LAG_RETRIES} attempts"
+            f"Timeseries {metric} kept redirecting to login after {_REDIRECT_RETRIES} attempts"
         )
 
     async def _visit_commodity_page(self, metric: str) -> str:
