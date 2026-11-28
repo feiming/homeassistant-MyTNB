@@ -433,9 +433,11 @@ class MyTNBClient:
                 errors.append(err)
                 return []
 
-        # Cost does not support sub-daily granularity.
+        # Both hourly. Cost used to be fetched daily (it was believed to have
+        # no sub-daily data); TNB serves it hourly, and the hours add up to
+        # exactly the daily totals.
         usage = await fetch("usage", "HOUR")
-        cost = await fetch("cost", None)
+        cost = await fetch("cost", "HOUR")
 
         if len(errors) == 2:
             raise next((e for e in errors if isinstance(e, MyTNBAuthError)), errors[0])

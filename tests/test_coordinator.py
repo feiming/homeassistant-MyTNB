@@ -287,3 +287,117 @@ async def test_no_smart_meter_is_a_clear_update_failure(
 
     with pytest.raises(_FakeUpdateFailed, match="No smart meter found"):
         await coordinator._async_update_data()
+
+
+# --- statistics import ---------------------------------------------------
+
+
+@pytest.fixture
+def stats_env(coordinator_module, monkeypatch):
+    """Run the real _async_insert_statistics against an in-memory recorder.
+
+    `stored` holds the existing rows, newest first, as the recorder's
+    get_last_statistics returns them; `imported` collects what gets written.
+    """
+    env = SimpleNamespace(stored=[], imported=[])
+
+    async def executor_job(func, hass, number_of_stats, statistic_id, *args):
+        return {statistic_id: env.stored[:number_of_stats]} if env.stored else {}
+
+    recorder = SimpleNamespace(async_add_executor_job=executor_job)
+    monkeypatch.setattr(coordinator_module, "get_instance", lambda hass: recorder)
+    monkeypatch.setattr(coordinator_module, "StatisticData", lambda **kw: kw)
+    monkeypatch.setattr(coordinator_module, "StatisticMetaData", lambda **kw: kw)
+    monkeypatch.setattr(
+        coordinator_module,
+        "async_add_external_statistics",
+        lambda hass, metadata, stats: env.imported.extend(stats),
+    )
+    return env
+
+
+def _hours(module, day: tuple[int, int, int], value: float, count: int = 24) -> list:
+    start = datetime(*day, tzinfo=module.TIMEZONE)
+    return [module.EnergyPoint(start=start + timedelta(hours=h), value=value) for h in range(count)]
+
+
+def _row(module, when: datetime, total: float) -> dict:
+    return {"start": when.timestamp(), "sum": total}
+
+
+async def _insert(coordinator, points):
+    coordinator._async_insert_statistics = type(coordinator)._async_insert_statistics.__get__(
+        coordinator
+    )
+    await coordinator._async_insert_statistics("cost", points, "MYR")
+
+
+async def test_daily_cost_rows_switch_to_hourly_without_double_counting(
+    coordinator, coordinator_module, stats_env
+):
+    """Cost used to be imported as one row per day at 00:00 holding the whole day.
+
+    Switching to hourly must redo that last day from the sum before it, or
+    its 01:00-23:00 hours would be added on top of the whole-day row.
+    """
+    tz = coordinator_module.TIMEZONE
+    stats_env.stored = [
+        _row(coordinator_module, datetime(2026, 11, 26, tzinfo=tz), 100.0),  # whole 26 Nov: 12
+        _row(coordinator_module, datetime(2026, 11, 25, tzinfo=tz), 88.0),
+    ]
+    points = _hours(coordinator_module, (2026, 11, 25), 0.5) + _hours(
+        coordinator_module, (2026, 11, 26), 0.5
+    )
+
+    await _insert(coordinator, points)
+
+    imported = stats_env.imported
+    assert imported[0]["start"] == datetime(2026, 11, 26, tzinfo=tz)  # 25 Nov left alone
+    assert len(imported) == 24
+    assert imported[0]["sum"] == 88.5
+    assert imported[-1]["sum"] == 100.0  # same day total as the daily row: no double count
+
+
+async def test_hourly_rows_redo_the_last_day_consistently(
+    coordinator, coordinator_module, stats_env
+):
+    """With hourly rows already there, redoing the last day reproduces its sums."""
+    tz = coordinator_module.TIMEZONE
+    last_day = datetime(2026, 11, 26, tzinfo=tz)
+    stats_env.stored = [
+        _row(coordinator_module, last_day + timedelta(hours=h), 176.0 + h + 1)
+        for h in reversed(range(24))
+    ] + [_row(coordinator_module, last_day - timedelta(hours=1), 176.0)]
+    points = _hours(coordinator_module, (2026, 11, 26), 1.0) + _hours(
+        coordinator_module, (2026, 11, 27), 1.0, count=3
+    )
+
+    await _insert(coordinator, points)
+
+    by_start = {row["start"]: row["sum"] for row in stats_env.imported}
+    assert by_start[last_day + timedelta(hours=23)] == 200.0  # unchanged
+    assert by_start[datetime(2026, 11, 27, 2, tzinfo=tz)] == 203.0
+
+
+async def test_last_day_missing_from_fetch_continues_after_it(
+    coordinator, coordinator_module, stats_env
+):
+    """Redoing a day the fetch doesn't cover would drop it from the sum."""
+    tz = coordinator_module.TIMEZONE
+    stats_env.stored = [
+        _row(coordinator_module, datetime(2026, 11, 26, tzinfo=tz), 100.0),
+        _row(coordinator_module, datetime(2026, 11, 25, tzinfo=tz), 88.0),
+    ]
+    points = _hours(coordinator_module, (2026, 11, 27), 0.5, count=2)
+
+    await _insert(coordinator, points)
+
+    assert [row["sum"] for row in stats_env.imported] == [100.5, 101.0]
+
+
+async def test_first_import_takes_everything(coordinator, coordinator_module, stats_env):
+    points = _hours(coordinator_module, (2026, 11, 25), 0.5, count=4)
+
+    await _insert(coordinator, points)
+
+    assert [row["sum"] for row in stats_env.imported] == [0.5, 1.0, 1.5, 2.0]

@@ -44,6 +44,10 @@ from .const import (
 
 _LOGGER = logging.getLogger(__name__)
 
+# Latest statistics rows to read when resuming an import: a full day of
+# hourly rows plus the row before that day, with some margin.
+_LAST_ROWS = 30
+
 
 def _minutes(delta: timedelta) -> str:
     return f"{round(delta.total_seconds() / 60)} min"
@@ -156,20 +160,41 @@ class MyTNBCoordinator(DataUpdateCoordinator[SmartMeterData]):
             hour = point.start.replace(minute=0, second=0, microsecond=0)
             hourly[hour] = hourly.get(hour, 0.0) + point.value
 
-        # Continue from the last imported statistic so the running sum stays
-        # monotonic even though each fetch only covers a sliding window.
+        # Continue the running sum from what's already imported, so it stays
+        # monotonic even though each fetch only covers a sliding window. The
+        # last imported day is redone hour by hour rather than continued after
+        # its last row: cost used to be imported as one row per day at 00:00
+        # holding the whole day, and adding that day's hours after it would
+        # count the day twice. Redoing it also completes a day that was only
+        # partly published when it was imported. Rows are overwritten by start.
         last_stats = await get_instance(self.hass).async_add_executor_job(
-            get_last_statistics, self.hass, 1, statistic_id, True, {"sum"}
+            get_last_statistics, self.hass, _LAST_ROWS, statistic_id, True, {"sum"}
         )
+        rows = last_stats.get(statistic_id) or []  # newest first
         cumulative = 0.0
-        last_start: datetime | None = None
-        if rows := last_stats.get(statistic_id):
-            cumulative = rows[0]["sum"] or 0.0
-            last_start = datetime.fromtimestamp(rows[0]["start"], tz=TIMEZONE)
+        resume_after: datetime | None = None  # import hours after this one
+        if rows:
+            starts = [datetime.fromtimestamp(row["start"], tz=TIMEZONE) for row in rows]
+            day_start = starts[0].replace(hour=0)
+            before = next((i for i, start in enumerate(starts) if start < day_start), None)
+            fetched_day = any(day_start <= hour < day_start + timedelta(days=1) for hour in hourly)
+            if fetched_day and (before is not None or len(rows) < _LAST_ROWS):
+                # Redo the day from the sum just before it (0 if nothing is).
+                # The row before can be a whole day earlier (daily rows), so
+                # only its sum is used: the redo starts at the day's 00:00.
+                if before is not None:
+                    cumulative = rows[before]["sum"] or 0.0
+                resume_after = day_start - timedelta(hours=1)
+            else:
+                # The fetch doesn't cover that day (or its start wasn't found):
+                # redoing it would drop its amount from the sum, so continue
+                # after the last row instead.
+                cumulative = rows[0]["sum"] or 0.0
+                resume_after = starts[0]
 
         stats: list[StatisticData] = []
         for hour in sorted(hourly):
-            if last_start is not None and hour <= last_start:
+            if resume_after is not None and hour <= resume_after:
                 continue
             cumulative += hourly[hour]
             stats.append(StatisticData(start=hour, state=hourly[hour], sum=cumulative))
