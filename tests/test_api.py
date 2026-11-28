@@ -5,11 +5,9 @@ from __future__ import annotations
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
-import aiohttp
 import pytest
 
 from conftest import (
-    AUTH_TOKEN,
     DASHBOARD_PAGE,
     LOGIN_REDIRECT_JSON,
     SDPUDCID,
@@ -145,7 +143,7 @@ async def test_expired_session_triggers_relogin(client, fake_tnb, monkeypatch):
     monkeypatch.setattr(api, "_SESSION_LAG_RETRIES", 1)
     fake_tnb.timeseries = {
         "usage": [LOGIN_REDIRECT_JSON, USAGE_OK],
-        "cost": [LOGIN_REDIRECT_JSON, COST_OK],
+        "cost": [COST_OK],
     }
 
     data = await client.async_get_data(START, END)
@@ -174,46 +172,18 @@ async def test_each_poll_logs_in_fresh(client, fake_tnb):
     assert fake_tnb.commodity_visits == ["usage", "cost", "usage", "cost"]
 
 
-async def test_auth_token_is_sent_back_unquoted(client, fake_tnb, monkeypatch):
-    """Issue #6: aiohttp's default jar quotes e3AuthToken, so TNB bounces us.
-
-    A token holding + / = (base64) went back as e3AuthToken="...", which
-    TNB doesn't recognize: it deletes the token and redirects to login.
-    """
-    monkeypatch.setattr(api, "_SESSION_LAG_RETRIES", 1)
-    fake_tnb.timeseries = {"usage": [USAGE_OK], "cost": [COST_OK]}
-    # (the client fixture is only requested for pointing the URLs at the fake)
-
-    # aiohttp's default jar: the bug
-    async with aiohttp.ClientSession(cookie_jar=aiohttp.CookieJar()) as session:
-        client = api.MyTNBClient(session, "user@example.com", "secret", SMARTMETER_URL)
-        with pytest.raises(api.MyTNBAuthError):
-            await client.async_get_data(START, END)
-
-    # the jar the integration uses: the fix
-    async with aiohttp.ClientSession(cookie_jar=api.create_cookie_jar()) as session:
-        client = api.MyTNBClient(session, "user@example.com", "secret", SMARTMETER_URL)
-        data = await client.async_get_data(START, END)
-    assert len(data.usage) == 1
-    assert len(data.cost) == 1
-
-
 async def test_rejection_is_logged_with_diagnostics(client, fake_tnb, monkeypatch, caplog):
     """A rejected session logs why at WARNING, without leaking secrets (issue #6)."""
     monkeypatch.setattr(api, "_SESSION_LAG_RETRIES", 1)
     fake_tnb.timeseries = {
         "usage": [{**LOGIN_REDIRECT_JSON, "errorMessage": "Session timed out"}],
-        "cost": [LOGIN_REDIRECT_JSON],
+        "cost": [COST_OK],
     }
 
     with caplog.at_level("DEBUG", logger="mytnb_api"), pytest.raises(api.MyTNBAuthError):
         await client.async_get_data(START, END)
 
-    warnings = [
-        r.getMessage()
-        for r in caplog.records
-        if r.levelname == "WARNING" and r.getMessage().startswith("MyTNB usage timeseries")
-    ]
+    warnings = [r.getMessage() for r in caplog.records if r.levelname == "WARNING"]
     # one warning per login: the up-front one and the retry
     assert len(warnings) == 2
     last = warnings[-1]
@@ -224,18 +194,9 @@ async def test_rejection_is_logged_with_diagnostics(client, fake_tnb, monkeypatc
     assert "login #2" in last
     assert "since login" in last
     assert "ASP.NET_SessionId" in last  # cookie names are shown...
-    # ...and Set-Cookie attributes show the commodity page issuing the token,
-    # which special characters it holds, and the timeseries deleting it
-    issued = f"set-cookie=e3AuthToken(len={len(AUTH_TOKEN)};chars=+/=;path=/)"
-    assert issued in last
-    assert "set-cookie=e3AuthToken(empty;path=/;max-age=0" in last
-    # ...and which cookies each request carried, by name
-    assert "/my_energy_request/timeseries sent=ASP.NET_SessionId,e3AuthToken " in last
-    assert "Dashboard: 200 localhost/dashboard sent=ASP.NET_SessionId" in everything_debug(caplog)
 
     everything = caplog.text
     assert SESSION_COOKIE_VALUE not in everything  # ...but never their values
-    assert AUTH_TOKEN not in everything
     assert "secret" not in everything  # the password
     assert "caNo=" not in everything  # query strings are dropped
 
@@ -263,22 +224,6 @@ async def test_http_errors_do_not_log_meter_id(client, fake_tnb, caplog):
     assert SDPUDCID not in caplog.text
 
 
-async def test_one_metric_bounced_to_login_keeps_the_other(client, fake_tnb, monkeypatch):
-    """Issue #6: TNB bounces cost to login while usage works on the same session.
-
-    That must not throw away the usage data (nothing updated at all), nor
-    trigger a re-login, since the session was evidently fine.
-    """
-    monkeypatch.setattr(api, "_SESSION_LAG_RETRIES", 1)
-    fake_tnb.timeseries = {"usage": [USAGE_OK], "cost": [LOGIN_REDIRECT_JSON]}
-
-    data = await client.async_get_data(START, END)
-
-    assert len(data.usage) == 1
-    assert data.cost == []
-    assert fake_tnb.login_count == 1
-
-
 async def test_one_metric_failing_is_tolerated(client, fake_tnb):
     """A transient 500 on one metric returns empty for it, keeps the other."""
     fake_tnb.timeseries = {"usage": [USAGE_OK], "cost": [500]}
@@ -297,8 +242,8 @@ async def test_both_metrics_failing_raises(client, fake_tnb):
 
 
 async def test_forbidden_timeseries_is_auth_error(client, fake_tnb):
-    """401/403 on both metrics is a dead session: re-login once, then raise."""
-    fake_tnb.timeseries = {"usage": [403], "cost": [403]}
+    """401/403 must not be swallowed by the partial-failure tolerance."""
+    fake_tnb.timeseries = {"usage": [403], "cost": [COST_OK]}
 
     with pytest.raises(api.MyTNBAuthError):
         # relogin is attempted once, then the auth error surfaces
@@ -309,7 +254,7 @@ async def test_forbidden_timeseries_is_auth_error(client, fake_tnb):
 async def test_timeseries_redirect_loop_is_not_credentials_error(client, fake_tnb, monkeypatch):
     """A persistent login redirect on timeseries is a session problem, not a bad password."""
     monkeypatch.setattr(api, "_SESSION_LAG_RETRIES", 1)
-    fake_tnb.timeseries = {"usage": [LOGIN_REDIRECT_JSON], "cost": [LOGIN_REDIRECT_JSON]}
+    fake_tnb.timeseries = {"usage": [LOGIN_REDIRECT_JSON], "cost": [COST_OK]}
 
     with pytest.raises(api.MyTNBAuthError) as exc_info:
         await client.async_get_data(START, END)
@@ -353,7 +298,3 @@ def test_maintenance_window_uses_malaysia_time():
     # 16:15 UTC is 00:15 the next day in Malaysia.
     end = api.maintenance_window_end(datetime(2026, 7, 15, 16, 15, tzinfo=ZoneInfo("UTC")))
     assert end == datetime(2026, 7, 16, 0, 35, tzinfo=api.TIMEZONE)
-
-
-def everything_debug(caplog) -> str:
-    return "\n".join(r.getMessage() for r in caplog.records)

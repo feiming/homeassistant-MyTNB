@@ -25,7 +25,6 @@ from .api import (
     MyTNBCredentialsError,
     MyTNBError,
     MyTNBNoSmartMeterError,
-    create_cookie_jar,
 )
 from .const import (
     CONF_SMARTMETER_URL,
@@ -61,7 +60,7 @@ class MyTNBConfigFlow(ConfigFlow, domain=DOMAIN):
         """Try the full login flow; returns (sdpudcid, errors)."""
         # detach() (not close()) releases the session without closing the
         # shared HA connector it borrows; HA also detaches it at shutdown.
-        session = async_create_clientsession(self.hass, cookie_jar=create_cookie_jar())
+        session = async_create_clientsession(self.hass)
         try:
             client = MyTNBClient(
                 session,
