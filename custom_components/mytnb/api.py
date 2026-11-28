@@ -80,6 +80,14 @@ _REDIRECT_RETRIES = 5
 _REDIRECT_BACKOFF_BASE = 2.0
 
 
+# After the retries above, wait this long before logging in again and
+# retrying just the rejected metrics: TNB's bad stretches can outlast them.
+_RELOGIN_DELAY = 60.0
+
+# (metric, granularity). Cost does not support sub-daily granularity.
+_METRICS: tuple[tuple[str, str | None], ...] = (("usage", "HOUR"), ("cost", None))
+
+
 def _redirect_backoff(attempt: int) -> float:
     """Seconds to wait after the redirect on attempt `attempt` (0-based)."""
     return _REDIRECT_BACKOFF_BASE * 2**attempt
@@ -254,12 +262,48 @@ class MyTNBClient:
         Logging in up front sends every poll down the same path as startup.
         """
         await self._relogin()
-        try:
-            return await self._fetch_all(start, end)
-        except MyTNBAuthError as err:
-            _LOGGER.debug("Session rejected (%s); logging in again", err)
-            await self._relogin()
-            return await self._fetch_all(start, end)
+        results: dict[str, list[EnergyPoint]] = {}
+        errors = await self._fetch_metrics(_METRICS, start, end, results)
+
+        rejected = [m for m in _METRICS if isinstance(errors.get(m[0]), MyTNBAuthError)]
+        if rejected:
+            # TNB rejects valid sessions in stretches that can outlast the
+            # retries above (issue #6). Give it a while, then log in again and
+            # retry only the metrics that were rejected; keep the others.
+            _LOGGER.debug(
+                "%s rejected (%s); logging in again in %.0fs",
+                ", ".join(m[0] for m in rejected),
+                "; ".join(str(errors[m[0]]) for m in rejected),
+                _RELOGIN_DELAY,
+            )
+            await asyncio.sleep(_RELOGIN_DELAY)
+            try:
+                await self._relogin()
+            except (MyTNBAuthError, MyTNBConnectionError) as err:
+                if not results:
+                    raise
+                _LOGGER.warning("Logging in again failed, keeping what was fetched: %s", err)
+            else:
+                for metric, _ in rejected:
+                    del errors[metric]
+                errors.update(await self._fetch_metrics(rejected, start, end, results))
+
+        return self._combine(results, errors)
+
+    @staticmethod
+    def _combine(
+        results: dict[str, list[EnergyPoint]], errors: dict[str, MyTNBError]
+    ) -> SmartMeterData:
+        """Data for the metrics that were fetched; raise if none were."""
+        if not results:
+            # Prefer an auth error, so the caller treats it as a rejection.
+            raise next(
+                (e for e in errors.values() if isinstance(e, MyTNBAuthError)),
+                next(iter(errors.values())),
+            )
+        for metric, err in errors.items():
+            _LOGGER.warning("Fetching %s failed: %s", metric, err)
+        return SmartMeterData(usage=results.get("usage", []), cost=results.get("cost", []))
 
     async def _relogin(self) -> None:
         async with self._auth_lock:
@@ -386,25 +430,24 @@ class MyTNBClient:
             f"No sdpudcid in dashboard response after {_SESSION_LAG_RETRIES} attempts"
         )
 
-    async def _fetch_all(self, start: datetime, end: datetime) -> SmartMeterData:
-        """Fetch both metrics, tolerating a transient failure of one."""
-        errors: list[MyTNBConnectionError] = []
+    async def _fetch_metrics(
+        self,
+        metrics: Sequence[tuple[str, str | None]],
+        start: datetime,
+        end: datetime,
+        results: dict[str, list[EnergyPoint]],
+    ) -> dict[str, MyTNBError]:
+        """Fetch each metric into `results`; return the errors by metric.
 
-        async def fetch(metric: str, granularity: str | None) -> list[EnergyPoint]:
+        A metric that fails doesn't stop the others from being fetched.
+        """
+        errors: dict[str, MyTNBError] = {}
+        for metric, granularity in metrics:
             try:
-                return await self._fetch_metric(metric, granularity, start, end)
-            except MyTNBConnectionError as err:
-                _LOGGER.warning("Fetching %s failed: %s", metric, err)
-                errors.append(err)
-                return []
-
-        # Cost does not support sub-daily granularity.
-        usage = await fetch("usage", "HOUR")
-        cost = await fetch("cost", None)
-
-        if len(errors) == 2:
-            raise errors[0]
-        return SmartMeterData(usage=usage, cost=cost)
+                results[metric] = await self._fetch_metric(metric, granularity, start, end)
+            except (MyTNBAuthError, MyTNBConnectionError) as err:
+                errors[metric] = err
+        return errors
 
     async def _fetch_metric(
         self, metric: str, granularity: str | None, start: datetime, end: datetime
